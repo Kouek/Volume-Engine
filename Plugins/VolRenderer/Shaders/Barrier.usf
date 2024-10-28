@@ -1,0 +1,9 @@
+#include "/Engine/Public/Platform.ush"
+
+Texture2D<float> InDepthTexture;
+RWTexture2D<float4> OutVolumeColorTexture;
+
+[numthreads(THREAD_PER_GROUP_X, THREAD_PER_GROUP_Y, THREAD_PER_GROUP_Z)]
+void Main(int3 DispatchThreadID : SV_DispatchThreadID) {
+    // Empty for resource barrier
+}

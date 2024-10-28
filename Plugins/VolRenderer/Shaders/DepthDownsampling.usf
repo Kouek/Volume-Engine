@@ -1,0 +1,34 @@
+#include "/Engine/Public/Platform.ush"
+
+int2 InDepthSize;
+int2 OutDepthSize;
+float4 InvDeviceZToWorldZTransform;
+Texture2D<float> InDepthTexture;
+RWTexture2D<float> OutDepthTexture;
+
+[numthreads(THREAD_PER_GROUP_X, THREAD_PER_GROUP_Y, THREAD_PER_GROUP_Z)]
+void Main(int3 DispatchThreadID : SV_DispatchThreadID) {
+    if (DispatchThreadID.x >= OutDepthSize.x || DispatchThreadID.y >= OutDepthSize.y)
+        return;
+    
+    int2 KernelSize;
+    float ScaleOutToIn = float(InDepthSize.y) / OutDepthSize.y;
+    KernelSize.y = round(ScaleOutToIn);
+    KernelSize.x = round(KernelSize.y * float(OutDepthSize.x) / OutDepthSize.y);
+    ScaleOutToIn = 1.f / ScaleOutToIn;
+    
+    float ReversedDepth = 0.f;
+    int2 InXYStart = floor(DispatchThreadID.xy * ScaleOutToIn);
+    for (int Dy = 0; Dy < KernelSize.y; ++Dy) {
+        for (int Dx = 0; Dx < KernelSize.x; ++Dx) {
+            int2 InXY = InXYStart + int2(Dx, Dy);
+            if (any(InXY >= InDepthSize))
+                continue;
+
+            float CurrReversedDepth = InDepthTexture.Load(int3(InXY, 0));
+            ReversedDepth = max(ReversedDepth, CurrReversedDepth);
+        }
+    }
+
+    OutDepthTexture[DispatchThreadID.xy] = ReversedDepth * InvDeviceZToWorldZTransform[0] + InvDeviceZToWorldZTransform[1] + 1.f / (ReversedDepth * InvDeviceZToWorldZTransform[2] - InvDeviceZToWorldZTransform[3]);
+}

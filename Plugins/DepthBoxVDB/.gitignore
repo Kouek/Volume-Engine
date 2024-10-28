@@ -1,0 +1,5 @@
+# Visual Studio
+out/
+.vs/
+Binaries/
+CMakeSettings.json
