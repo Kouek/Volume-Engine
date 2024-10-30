@@ -9,7 +9,7 @@
 
 #include <glm/glm.hpp>
 
-#include <DepthBoxVDB/Util.h>
+#include <CUDA/Util.h>
 
 namespace DepthBoxVDB
 {
@@ -26,7 +26,36 @@ namespace DepthBoxVDB
 			MAX
 		};
 
-		struct DEPTHBOXVDB_ALIGN VDBParameters
+		inline size_t SizeOfVoxelType(EVoxelType VoxelType)
+		{
+			switch (VoxelType)
+			{
+				case EVoxelType::UInt8:
+					return sizeof(uint8_t);
+				case EVoxelType::Float32:
+					return sizeof(float);
+				default:
+					return 0;
+			}
+		}
+
+		inline cudaChannelFormatDesc CUDAChannelDescOfVoxelType(EVoxelType VoxelType)
+		{
+			cudaChannelFormatDesc ChannelDesc{};
+			switch (VoxelType)
+			{
+				case EVoxelType::UInt8:
+					ChannelDesc = cudaCreateChannelDesc<uint8_t>();
+					break;
+				case EVoxelType::Float32:
+					ChannelDesc = cudaCreateChannelDesc<float>();
+					break;
+			}
+
+			return ChannelDesc;
+		}
+
+		struct CUDA_ALIGN VDBParameters
 		{
 			static constexpr int32_t MaxLevelNum = 3;
 			static constexpr int32_t MaxLogChildPerLevel = 9;
@@ -48,12 +77,18 @@ namespace DepthBoxVDB
 		class IVDBBuilder
 		{
 		public:
-			static std::unique_ptr<IVDBBuilder> Create();
+			struct CreateParameters
+			{
+			};
+			static std::unique_ptr<IVDBBuilder> Create(const CreateParameters& Params);
 			virtual ~IVDBBuilder() {}
 
 			struct FullBuildParameters
 			{
+				CoordType	  VoxelPerVolume;
+				uint32_t	  EmptyScalarRangeNum;
 				uint8_t*	  RAWVolumeData;
+				glm::vec2*	  EmptyScalarRanges;
 				VDBParameters VDBParams;
 			};
 			virtual void FullBuild(const FullBuildParameters& Params) = 0;

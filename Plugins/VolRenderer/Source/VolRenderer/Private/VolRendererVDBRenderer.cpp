@@ -74,7 +74,7 @@ IMPLEMENT_GLOBAL_SHADER(FCompositionCS, "/VolRenderer/Composition.usf", "Main", 
 FVolRendererVDBRenderer::FVolRendererVDBRenderer()
 {
 	VDBRenderer = DepthBoxVDB::VolRenderer::IVDBRenderer::Create(
-		DepthBoxVDB::VolRenderer::CastFromRHIInterfaceType(GDynamicRHI->GetInterfaceType()));
+		{ .RHIType = DepthBoxVDB::VolRenderer::CastFromRHIInterfaceType(GDynamicRHI->GetInterfaceType()) });
 }
 
 FVolRendererVDBRenderer::~FVolRendererVDBRenderer()

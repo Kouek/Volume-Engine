@@ -16,6 +16,7 @@ set(THIRD_PARTY_DIR "${CMAKE_CURRENT_LIST_DIR}/ThirdParty")
 #<dep>
 #<glm>
 add_subdirectory("${THIRD_PARTY_DIR}/glm")
+add_definitions("-DGLM_ENABLE_EXPERIMENTAL")
 #<\glm>
 #<\dep>
 
@@ -54,7 +55,7 @@ target_compile_options(
 
 #<app>
 #<Dummy>
-set(TARGET_NAME "VolDataDummy")
+set(TARGET_NAME "DepthBoxVDBDummy")
 add_executable(
 	${TARGET_NAME}
 	"${CMAKE_CURRENT_LIST_DIR}/Dummy.cpp"

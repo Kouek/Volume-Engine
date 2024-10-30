@@ -1,5 +1,6 @@
 #pragma once
 
+#include <iostream>
 #include <sstream>
 
 #include "CoreMinimal.h"
@@ -34,4 +35,29 @@ namespace VolRenderer
 			return std::stringbuf::sync();
 		}
 	};
+
+	class FStdOutputLinker
+	{
+	public:
+		FStdOutputLinker()
+		{
+			PrevOutputStreamBuffer = std::cout.rdbuf();
+			PrevErrorStreamBuffer = std::cerr.rdbuf();
+			std::cout.set_rdbuf(&FStdStream<ELogVerbosity::Log>::Instance());
+			std::cerr.set_rdbuf(&FStdStream<ELogVerbosity::Error>::Instance());
+		}
+		~FStdOutputLinker()
+		{
+			std::cout.flush();
+			std::cerr.flush();
+
+			std::cout.set_rdbuf(PrevOutputStreamBuffer);
+			std::cerr.set_rdbuf(PrevErrorStreamBuffer);
+		}
+
+	private:
+		std::streambuf* PrevOutputStreamBuffer = nullptr;
+		std::streambuf* PrevErrorStreamBuffer = nullptr;
+	};
+
 } // namespace VolRenderer

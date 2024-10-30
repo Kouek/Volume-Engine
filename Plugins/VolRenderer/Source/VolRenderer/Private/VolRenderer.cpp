@@ -14,9 +14,6 @@ void FVolRendererModule::StartupModule()
 	// in the .uplugin file per-module
 	auto ShadersDir = FPaths::Combine(FPaths::ProjectPluginsDir(), TEXT("VolRenderer/Shaders"));
 	AddShaderSourceDirectoryMapping(TEXT("/VolRenderer"), ShadersDir);
-
-	std::cout.set_rdbuf(&VolRenderer::FStdStream<ELogVerbosity::Type::Log>::Instance());
-	std::cerr.set_rdbuf(&VolRenderer::FStdStream<ELogVerbosity::Type::Error>::Instance());
 }
 
 void FVolRendererModule::ShutdownModule()

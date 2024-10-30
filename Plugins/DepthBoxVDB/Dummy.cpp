@@ -4,6 +4,6 @@ int main()
 {
 	using namespace DepthBoxVDB::VolData;
 
-	auto Builder = IVDBBuilder::Create();
+	auto Builder = IVDBBuilder::Create({});
 	return 0;
 }

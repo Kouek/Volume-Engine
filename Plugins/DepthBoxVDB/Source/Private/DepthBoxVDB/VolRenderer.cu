@@ -1,29 +1,30 @@
 #include "VolRenderer.h"
 
 std::unique_ptr<DepthBoxVDB::VolRenderer::IVDBRenderer>
-DepthBoxVDB::VolRenderer::IVDBRenderer::Create(ERHIType RHIType)
+DepthBoxVDB::VolRenderer::IVDBRenderer::Create(const CreateParameters& Params)
 {
-	if (RHIType == ERHIType::D3D12)
+	if (Params.RHIType == ERHIType::D3D12)
 	{
-		return std::make_unique<VDBRendererImpl>(RHIType);
+		return std::make_unique<VDBRenderer>(Params);
 	}
 	return {};
 }
 
-DepthBoxVDB::VolRenderer::VDBRendererImpl::VDBRendererImpl(ERHIType RHIType) : RHIType(RHIType)
+DepthBoxVDB::VolRenderer::VDBRenderer::VDBRenderer(const CreateParameters& Params)
+	: RHIType(Params.RHIType)
 {
 	int DeviceNum = 0;
-	DEPTHBOXVDB_CHECK(cudaGetDeviceCount(&DeviceNum));
+	CUDA_CHECK(cudaGetDeviceCount(&DeviceNum));
 	assert(DeviceNum > 0);
 
 	cudaDeviceProp Prop;
-	DEPTHBOXVDB_CHECK(cudaGetDeviceProperties(&Prop, 0));
+	CUDA_CHECK(cudaGetDeviceProperties(&Prop, 0));
 	D3D12NodeMask = Prop.luidDeviceNodeMask;
 
-	DEPTHBOXVDB_CHECK(cudaStreamCreate(&Stream));
+	CUDA_CHECK(cudaStreamCreate(&Stream));
 }
 
-void DepthBoxVDB::VolRenderer::VDBRendererImpl::Register(const RendererParameters& Params)
+void DepthBoxVDB::VolRenderer::VDBRenderer::Register(const RendererParameters& Params)
 {
 	ID3D12Device*	Device = reinterpret_cast<ID3D12Device*>(Params.Device);
 	ID3D12Resource* InDepthTextureNative = reinterpret_cast<ID3D12Resource*>(Params.InDepthTexture);
@@ -40,22 +41,22 @@ void DepthBoxVDB::VolRenderer::VDBRendererImpl::Register(const RendererParameter
 		&& RenderResolution.y == OutColorTexture->TextureDesc.Height);
 }
 
-void DepthBoxVDB::VolRenderer::VDBRendererImpl::Unregister()
+void DepthBoxVDB::VolRenderer::VDBRenderer::Unregister()
 {
 	InDepthTexture.reset();
 	OutColorTexture.reset();
 }
 
-void DepthBoxVDB::VolRenderer::VDBRendererImpl::Render(const RenderParameters& Params)
+void DepthBoxVDB::VolRenderer::VDBRenderer::Render(const RenderParameters& Params)
 {
 	if (!InDepthTexture || !OutColorTexture)
 		return;
 
-	dim3	   ThreadPerBlock(16, 16, 1);
+	dim3	   ThreadPerBlock(CUDA::ThreadPerBlockX2D, CUDA::ThreadPerBlockY2D, 1);
 	dim3	   BlockPerGrid((RenderResolution.x + ThreadPerBlock.x - 1) / ThreadPerBlock.x,
 			  (RenderResolution.y + ThreadPerBlock.y - 1) / ThreadPerBlock.y);
 	static int Time = 0;
-	ParallelFor(
+	CUDA::ParallelFor(
 		BlockPerGrid, ThreadPerBlock,
 		[Time = Time, RenderResolution = RenderResolution,
 			InDepthSurface = InDepthTexture->SurfaceObject,
@@ -85,5 +86,5 @@ void DepthBoxVDB::VolRenderer::VDBRendererImpl::Render(const RenderParameters& P
 	if (Time == RenderResolution.x)
 		Time = 0;
 
-	DEPTHBOXVDB_CHECK(cudaStreamSynchronize(Stream));
+	CUDA_CHECK(cudaStreamSynchronize(Stream));
 }

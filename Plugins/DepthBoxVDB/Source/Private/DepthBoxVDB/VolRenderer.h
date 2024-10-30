@@ -7,16 +7,17 @@
 #include <cuda_runtime.h>
 
 #include "D3D12Util.h"
+#include "Util.h"
 
 namespace DepthBoxVDB
 {
 	namespace VolRenderer
 	{
-		class VDBRendererImpl : public IVDBRenderer
+		class VDBRenderer : public IVDBRenderer
 		{
 		public:
-			VDBRendererImpl(ERHIType RHIType);
-			~VDBRendererImpl() {}
+			VDBRenderer(const CreateParameters& Params);
+			~VDBRenderer() {}
 
 			void Register(const RendererParameters& Params) override;
 			void Unregister() override;
@@ -26,7 +27,7 @@ namespace DepthBoxVDB
 			ERHIType RHIType;
 
 			UINT		 D3D12NodeMask;
-			cudaStream_t Stream;
+			cudaStream_t Stream = 0;
 
 			glm::uvec2 RenderResolution;
 

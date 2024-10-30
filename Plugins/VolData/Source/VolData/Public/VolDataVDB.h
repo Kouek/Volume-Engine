@@ -11,8 +11,12 @@
 
 struct FVolDataVDBCPUData
 {
-	FIntVector	  ReorderedVoxelPerVolume;
-	TArray<uint8> RAWVolumeData;
+	FIntVector		  VoxelPerVolume;
+	uint32			  EmptyScalarRangeNum;
+	TArray<uint8>	  RAWVolumeData;
+	TArray<glm::vec2> EmptyScalarRanges;
+
+	bool IsComplete() const { return !RAWVolumeData.IsEmpty() && !EmptyScalarRanges.IsEmpty(); }
 };
 
 USTRUCT()
@@ -45,10 +49,12 @@ struct FVolDataVDBParameters
 	int32 VoxelPerAtlasBrick;
 	UPROPERTY(VisibleAnywhere)
 	FIntVector BrickPerVolume;
-	UPROPERTY(EditAnywhere)
+	UPROPERTY(VisibleAnywhere)
+	int32 MaxAllowedGPUMemoryInGB = 2;
+	UPROPERTY(VisibleAnywhere)
 	FIntVector InitialVoxelPerAtlas;
 
-	TOptional<FString> InitializeAndCheck(const FIntVector3& ReorderedVoxelPerVolume, EVolDataVoxelType InVoxelType)
+	TOptional<FString> InitializeAndCheck(const FIntVector3& VoxelPerVolume, EVolDataVoxelType InVoxelType)
 	{
 		VoxelType = InVoxelType;
 
@@ -70,22 +76,39 @@ struct FVolDataVDBParameters
 		RootLevel = 0;
 		while (true)
 		{
-			if (ChildCoverVoxelPerLevels[RootLevel] >= ReorderedVoxelPerVolume.X
-				&& ChildCoverVoxelPerLevels[RootLevel] >= ReorderedVoxelPerVolume.Y
-				&& ChildCoverVoxelPerLevels[RootLevel] >= ReorderedVoxelPerVolume.Z)
+			int32 CoverVoxelCurrLevel = ChildCoverVoxelPerLevels[RootLevel] * ChildPerLevels[RootLevel];
+			if (CoverVoxelCurrLevel >= VoxelPerVolume.X && CoverVoxelCurrLevel >= VoxelPerVolume.Y
+				&& CoverVoxelCurrLevel >= VoxelPerVolume.Z)
 				break;
 
 			++RootLevel;
 			if (RootLevel == MaxLevelNum)
 			{
-				return FString::Format(
-					TEXT("VDB cannot cover volume with size {0}."), { ReorderedVoxelPerVolume.ToString() });
+				return FString::Format(TEXT("VDB cannot cover volume with size {0}."), { VoxelPerVolume.ToString() });
 			}
 		}
 
 		for (int Dim = 0; Dim < 3; ++Dim)
 		{
-			BrickPerVolume[Dim] = (ReorderedVoxelPerVolume[Dim] + ChildPerLevels[0] - 1) / ChildCoverVoxelPerLevels[0];
+			BrickPerVolume[Dim] = (VoxelPerVolume[Dim] + ChildPerLevels[0] - 1) / ChildPerLevels[0];
+		}
+
+		InitialVoxelPerAtlas = BrickPerVolume * VoxelPerAtlasBrick;
+		{
+			size_t VoxelSize = VolData::SizeOfVoxelType(VoxelType);
+			size_t MaxAllowedGPUMemoryInByte = VoxelSize * MaxAllowedGPUMemoryInGB * (1 << 30);
+			while ([&]() {
+				return InitialVoxelPerAtlas.Z > 0
+					&& VoxelSize * InitialVoxelPerAtlas.X * InitialVoxelPerAtlas.Y * InitialVoxelPerAtlas.Z
+					> MaxAllowedGPUMemoryInByte;
+			}())
+				InitialVoxelPerAtlas.Z -= ApronAndDepthWidth;
+		}
+
+		if (InitialVoxelPerAtlas.Z < VoxelPerVolume.Z)
+		{
+			return FString(
+				TEXT("Volume texture streaming is NOT supported yet! MaxAllowedGPUMemoryInGB is too small."));
 		}
 
 		return {};
@@ -127,12 +150,27 @@ struct FVolDataLoadRAWVolumeParameters
 {
 	GENERATED_BODY()
 
+	bool bNeedReload = false;
+
 	UPROPERTY(EditAnywhere)
 	EVolDataVoxelType VoxelType = EVolDataVoxelType::None;
 	UPROPERTY(EditAnywhere)
 	FIntVector AxisOrder = { 1, 2, 3 };
 	UPROPERTY(EditAnywhere)
 	FIntVector VoxelPerVolume = { 256, 256, 256 };
+	UPROPERTY(VisibleAnywhere)
+	FFilePath SourcePath;
+};
+
+USTRUCT()
+struct FVolDataLoadTransferFunctionParameters
+{
+	GENERATED_BODY()
+
+	bool bNeedReload = false;
+
+	UPROPERTY(VisibleAnywhere)
+	uint32 Resolution = 256;
 	UPROPERTY(VisibleAnywhere)
 	FFilePath SourcePath;
 };
@@ -150,6 +188,11 @@ public:
 	FVolDataLoadRAWVolumeParameters LoadRAWVolumeParams;
 	UFUNCTION(CallInEditor, Category = "VolData")
 	void LoadRAWVolume();
+
+	UPROPERTY(EditAnywhere, Category = "VolData")
+	FVolDataLoadTransferFunctionParameters LoadTransferFunctionParameters;
+	UFUNCTION(CallInEditor, Category = "VolData")
+	void LoadTransferFunction();
 
 	void PostLoad() override;
 
