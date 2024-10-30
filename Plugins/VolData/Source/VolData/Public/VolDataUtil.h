@@ -1,16 +1,18 @@
 #pragma once
 
+#include <iostream>
+#include <sstream>
+
 #include "CoreMinimal.h"
 
-#include "Engine/VolumeTexture.h"
+DECLARE_LOG_CATEGORY_EXTERN(LogVolData, Log, All);
 
 UENUM()
 enum class EVolDataVoxelType : uint8
 {
 	None = 0 UMETA(DisplayName = "None"),
 	UInt8	UMETA(DisplayName = "Unsigned Int 8 bit"),
-	Float32 UMETA(DisplayName = "Float 32 bit"),
-	MAX
+	Float32 UMETA(DisplayName = "Float 32 bit")
 };
 
 namespace VolData
@@ -64,30 +66,62 @@ namespace VolData
 		return MakeTuple(AxisOrderMap, ReorderedVoxelPerVolume);
 	}
 
+	template <ELogVerbosity::Type Verbosity> class FStdStream : public std::stringbuf
+	{
+	public:
+		static FStdStream& Instance()
+		{
+			static FStdStream Stream;
+			return Stream;
+		}
+
+	protected:
+		int sync()
+		{
+			if (str().empty())
+			{
+				return std::stringbuf::sync();
+			}
+
+			if constexpr (Verbosity == ELogVerbosity::Error)
+			{
+				UE_LOG(LogVolData, Error, TEXT("%s"), *FString(str().c_str()));
+			}
+			else if constexpr (Verbosity == ELogVerbosity::Log)
+			{
+				UE_LOG(LogVolData, Log, TEXT("%s"), *FString(str().c_str()));
+			}
+
+			str("");
+			return std::stringbuf::sync();
+		}
+	};
+
+	class FStdOutputLinker
+	{
+	public:
+		FStdOutputLinker()
+		{
+			PrevOutputStreamBuffer = std::cout.rdbuf();
+			PrevErrorStreamBuffer = std::cerr.rdbuf();
+			std::cout.set_rdbuf(&FStdStream<ELogVerbosity::Log>::Instance());
+			std::cerr.set_rdbuf(&FStdStream<ELogVerbosity::Error>::Instance());
+		}
+		~FStdOutputLinker()
+		{
+			std::cout.flush();
+			std::cerr.flush();
+
+			std::cout.set_rdbuf(PrevOutputStreamBuffer);
+			std::cerr.set_rdbuf(PrevErrorStreamBuffer);
+		}
+
+	private:
+		std::streambuf* PrevOutputStreamBuffer = nullptr;
+		std::streambuf* PrevErrorStreamBuffer = nullptr;
+	};
+
 } // namespace VolData
 
 template <typename T>
 concept FVolDataVoxelType = std::is_same_v<T, uint8> || std::is_same_v<T, uint16> || std::is_same_v<T, float>;
-
-DECLARE_LOG_CATEGORY_EXTERN(LogVolData, Log, All);
-
-class FRAWVolumeData
-{
-public:
-	struct LoadFromFileParameters
-	{
-		EVolDataVoxelType VoxelType;
-		FIntVector3		  VoxelPerVolume;
-		FIntVector3		  AxisOrder;
-		FFilePath		  SourcePath;
-	};
-	static TVariant<TArray<uint8>, FString> LoadFromFile(const LoadFromFileParameters& Params);
-
-	struct CreateTextureParameters
-	{
-		EVolDataVoxelType	 VoxelType;
-		FIntVector3			 VoxelPerVolume;
-		const TArray<uint8>& RAWVolumeData;
-	};
-	static TVariant<UVolumeTexture*, FString> CreateTexture(const CreateTextureParameters& Params);
-};

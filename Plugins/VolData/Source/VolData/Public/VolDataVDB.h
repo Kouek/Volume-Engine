@@ -11,8 +11,12 @@
 
 struct FVolDataVDBCPUData
 {
-	FIntVector	  ReorderedVoxelPerVolume;
-	TArray<uint8> RAWVolumeData;
+	FIntVector		  VoxelPerVolume;
+	uint32			  EmptyScalarRangeNum;
+	TArray<uint8>	  RAWVolumeData;
+	TArray<glm::vec2> EmptyScalarRanges;
+
+	bool IsComplete() const { return !RAWVolumeData.IsEmpty() && !EmptyScalarRanges.IsEmpty(); }
 };
 
 USTRUCT()
@@ -26,100 +30,34 @@ struct FVolDataVDBParameters
 	UPROPERTY(VisibleAnywhere)
 	EVolDataVoxelType VoxelType;
 	UPROPERTY(VisibleAnywhere)
-	int32 RootLevel;
+	int32 RootLevel = 0;
 	UPROPERTY(EditAnywhere)
 	int32 ApronWidth = 1;
 	UPROPERTY(VisibleAnywhere)
-	int32 ApronAndDepthWidth;
+	int32 ApronAndDepthWidth = 1;
 	UPROPERTY(EditAnywhere)
 	int32 LogChildPerLevels[MaxLevelNum] = { 5, 4, 3 };
+	int32 LogChildAtLevelZeroCached = 0;
 	UPROPERTY(VisibleAnywhere)
-	int32 ChildPerLevels[MaxLevelNum];
+	int32 ChildPerLevels[MaxLevelNum] = { 32, 16, 8 };
 	UPROPERTY(VisibleAnywhere)
-	int32 ChildCoverVoxelPerLevels[MaxLevelNum];
+	int32 ChildCoverVoxelPerLevels[MaxLevelNum] = { 1, 32, 32 * 16 };
 	UPROPERTY(VisibleAnywhere)
-	int32 DepthPositionInAtlasBrick[2];
+	int32 DepthPositionInAtlasBrick[2] = { -1, 32 };
 	UPROPERTY(EditAnywhere)
 	bool bUseDepthBox = true;
 	UPROPERTY(VisibleAnywhere)
-	int32 VoxelPerAtlasBrick;
+	int32 VoxelPerAtlasBrick = 34;
 	UPROPERTY(VisibleAnywhere)
-	FIntVector BrickPerVolume;
+	FIntVector BrickPerVolume = { 0, 0, 0 };
 	UPROPERTY(EditAnywhere)
-	FIntVector InitialVoxelPerAtlas;
+	int32 MaxAllowedGPUMemoryInGB = 2;
+	UPROPERTY(VisibleAnywhere)
+	FIntVector InitialVoxelPerAtlas{ 0, 0, 0 };
 
-	TOptional<FString> InitializeAndCheck(const FIntVector3& ReorderedVoxelPerVolume, EVolDataVoxelType InVoxelType)
-	{
-		VoxelType = InVoxelType;
+	TOptional<FString> InitializeAndCheck(const FIntVector3& VoxelPerVolume, EVolDataVoxelType InVoxelType);
 
-		for (int Lev = 0; Lev < MaxLevelNum; ++Lev)
-		{
-			int32 LogChildPerLevel = LogChildPerLevels[Lev];
-			if (LogChildPerLevel < 0 || LogChildPerLevel > MaxLogChildPerLevel)
-				return FString::Format(TEXT("Invalid LogChildPerLevels[{0}] = {1}."), { Lev, LogChildPerLevel });
-
-			ChildPerLevels[Lev] = 1 << LogChildPerLevel;
-			ChildCoverVoxelPerLevels[Lev] = Lev == 0 ? 1 : ChildCoverVoxelPerLevels[Lev - 1] * ChildPerLevels[Lev];
-		}
-
-		ApronAndDepthWidth = ApronWidth + (bUseDepthBox ? 1 : 0);
-		DepthPositionInAtlasBrick[0] = -ApronAndDepthWidth;
-		DepthPositionInAtlasBrick[1] = ChildPerLevels[0] - 1 + ApronAndDepthWidth;
-		VoxelPerAtlasBrick = ChildPerLevels[0] + ApronAndDepthWidth;
-
-		RootLevel = 0;
-		while (true)
-		{
-			if (ChildCoverVoxelPerLevels[RootLevel] >= ReorderedVoxelPerVolume.X
-				&& ChildCoverVoxelPerLevels[RootLevel] >= ReorderedVoxelPerVolume.Y
-				&& ChildCoverVoxelPerLevels[RootLevel] >= ReorderedVoxelPerVolume.Z)
-				break;
-
-			++RootLevel;
-			if (RootLevel == MaxLevelNum)
-			{
-				return FString::Format(
-					TEXT("VDB cannot cover volume with size {0}."), { ReorderedVoxelPerVolume.ToString() });
-			}
-		}
-
-		for (int Dim = 0; Dim < 3; ++Dim)
-		{
-			BrickPerVolume[Dim] = (ReorderedVoxelPerVolume[Dim] + ChildPerLevels[0] - 1) / ChildCoverVoxelPerLevels[0];
-		}
-
-		return {};
-	}
-
-	operator DepthBoxVDB::VolData::VDBParameters()
-	{
-		DepthBoxVDB::VolData::VDBParameters Ret;
-#define ASSIGN(Member) Ret.Member = Member
-
-		Ret.VoxelType = (DepthBoxVDB::VolData::EVoxelType)(uint8)VoxelType;
-		ASSIGN(RootLevel);
-		ASSIGN(ApronWidth);
-		ASSIGN(ApronAndDepthWidth);
-		for (int32 i = 0; i < MaxLevelNum; ++i)
-		{
-			ASSIGN(LogChildPerLevels[i]);
-			ASSIGN(ChildPerLevels[i]);
-			ASSIGN(ChildCoverVoxelPerLevels[i]);
-		}
-		ASSIGN(DepthPositionInAtlasBrick[0]);
-		ASSIGN(DepthPositionInAtlasBrick[1]);
-		ASSIGN(bUseDepthBox);
-		ASSIGN(VoxelPerAtlasBrick);
-		for (int32 i = 0; i < 3; ++i)
-		{
-			ASSIGN(BrickPerVolume[i]);
-			ASSIGN(InitialVoxelPerAtlas[i]);
-		}
-
-#undef ASSIGN
-
-		return Ret;
-	}
+	operator DepthBoxVDB::VolData::VDBParameters();
 };
 
 USTRUCT()
@@ -127,12 +65,27 @@ struct FVolDataLoadRAWVolumeParameters
 {
 	GENERATED_BODY()
 
+	bool bNeedReload = false;
+
 	UPROPERTY(EditAnywhere)
 	EVolDataVoxelType VoxelType = EVolDataVoxelType::None;
 	UPROPERTY(EditAnywhere)
 	FIntVector AxisOrder = { 1, 2, 3 };
 	UPROPERTY(EditAnywhere)
 	FIntVector VoxelPerVolume = { 256, 256, 256 };
+	UPROPERTY(VisibleAnywhere)
+	FFilePath SourcePath;
+};
+
+USTRUCT()
+struct FVolDataLoadTransferFunctionParameters
+{
+	GENERATED_BODY()
+
+	bool bNeedReload = false;
+
+	UPROPERTY(VisibleAnywhere)
+	uint32 Resolution = 256;
 	UPROPERTY(VisibleAnywhere)
 	FFilePath SourcePath;
 };
@@ -151,9 +104,14 @@ public:
 	UFUNCTION(CallInEditor, Category = "VolData")
 	void LoadRAWVolume();
 
+	UPROPERTY(EditAnywhere, Category = "VolData")
+	FVolDataLoadTransferFunctionParameters LoadTransferFunctionParameters;
+	UFUNCTION(CallInEditor, Category = "VolData")
+	void LoadTransferFunction();
+
 	void PostLoad() override;
 
-	void BuildVDB(bool bNeedReLoad = false);
+	void BuildVDB(bool bNeedReload = false, bool bNeedRelayoutAtlas = false);
 
 #if WITH_EDITOR
 	void PostEditChangeProperty(struct FPropertyChangedEvent& PropertyChangedEvent) override;
@@ -162,5 +120,6 @@ public:
 private:
 	TSharedPtr<FVolDataVDBCPUData> CPUData;
 
-	std::unique_ptr<DepthBoxVDB::VolData::IVDBBuilder> VDBBuilder;
+	std::shared_ptr<DepthBoxVDB::VolData::IVDBDataProvider> VDBDataProvider;
+	std::unique_ptr<DepthBoxVDB::VolData::IVDBBuilder>		VDBBuilder;
 };

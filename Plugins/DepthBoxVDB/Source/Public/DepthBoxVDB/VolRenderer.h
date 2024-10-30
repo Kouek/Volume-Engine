@@ -20,7 +20,11 @@ namespace DepthBoxVDB
 		class IVDBRenderer
 		{
 		public:
-			static std::unique_ptr<IVDBRenderer> Create(ERHIType RHIType);
+			struct CreateParameters
+			{
+				ERHIType RHIType;
+			};
+			static std::unique_ptr<IVDBRenderer> Create(const CreateParameters& Params);
 			virtual ~IVDBRenderer() {}
 
 			struct RendererParameters

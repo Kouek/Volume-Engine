@@ -4,9 +4,9 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
-#include "d3d12.h"
+#include <d3d12.h>
 
-#include <DepthBoxVDB/Util.h>
+#include <CUDA/Util.h>
 
 struct D3D12InteropCUDA
 {
@@ -54,7 +54,7 @@ struct D3D12TextureInteropCUDA : D3D12InteropCUDA
 			ExternalMemoryHandleDesc.handle.win32.handle = SharedHandle;
 			ExternalMemoryHandleDesc.size = D3D12ResourceAllocationInfo.SizeInBytes;
 			ExternalMemoryHandleDesc.flags = cudaExternalMemoryDedicated;
-			DEPTHBOXVDB_CHECK(cudaImportExternalMemory(&ExternalMemory, &ExternalMemoryHandleDesc));
+			CUDA_CHECK(cudaImportExternalMemory(&ExternalMemory, &ExternalMemoryHandleDesc));
 			CloseHandle(SharedHandle);
 		}
 
@@ -76,27 +76,27 @@ struct D3D12TextureInteropCUDA : D3D12InteropCUDA
 		ExternalMmeoryMipmappedArrayDesc.flags = cudaArraySurfaceLoadStore;
 
 		cudaMipmappedArray_t MipmappedArray = nullptr;
-		DEPTHBOXVDB_CHECK(cudaExternalMemoryGetMappedMipmappedArray(
+		CUDA_CHECK(cudaExternalMemoryGetMappedMipmappedArray(
 			&MipmappedArray, ExternalMemory, &ExternalMmeoryMipmappedArrayDesc));
 
 		cudaArray_t Array = nullptr;
-		DEPTHBOXVDB_CHECK(cudaGetMipmappedArrayLevel(&Array, MipmappedArray, 0));
+		CUDA_CHECK(cudaGetMipmappedArrayLevel(&Array, MipmappedArray, 0));
 
 		cudaResourceDesc ResDesc{};
 		ResDesc.resType = cudaResourceTypeArray;
 		ResDesc.res.array.array = Array;
-		DEPTHBOXVDB_CHECK(cudaCreateSurfaceObject(&SurfaceObject, &ResDesc));
+		CUDA_CHECK(cudaCreateSurfaceObject(&SurfaceObject, &ResDesc));
 	}
 
 	~D3D12TextureInteropCUDA()
 	{
 		if (SurfaceObject != 0)
 		{
-			DEPTHBOXVDB_CHECK(cudaDestroySurfaceObject(SurfaceObject));
+			CUDA_CHECK(cudaDestroySurfaceObject(SurfaceObject));
 		}
 		if (!ExternalMemory)
 		{
-			DEPTHBOXVDB_CHECK(cudaDestroyExternalMemory(ExternalMemory));
+			CUDA_CHECK(cudaDestroyExternalMemory(ExternalMemory));
 		}
 	}
 };

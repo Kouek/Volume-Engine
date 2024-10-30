@@ -12,15 +12,16 @@
 
 #include <glm/glm.hpp>
 
-namespace DepthBoxVDB
+namespace CUDA
 {
-	inline void ThrowIfFailed(cudaError_t Err)
+
+	inline cudaError_t Check(cudaError_t Err)
 	{
 		if (Err == cudaSuccess)
-			return;
+			return cudaSuccess;
 		auto ErrMsg = std::format("{}: {}\n", cudaGetErrorName(Err), cudaGetErrorString(Err));
 		std::cerr << ErrMsg;
-		throw std::runtime_error(ErrMsg);
+		return Err;
 	}
 
 #ifdef __CUDACC__
@@ -41,14 +42,21 @@ namespace DepthBoxVDB
 #endif
 	}
 
-} // namespace DepthBoxVDB
-
 #ifdef RELEASE
-	#define DEPTHBOXVDB_CHECK(Call) Call
+	#define CUDA_CHECK(Call) Call
 #else
-	#define DEPTHBOXVDB_CHECK(Call) DepthBoxVDB::ThrowIfFailed(Call)
+	#define CUDA_CHECK(Call) CUDA::Check(Call)
 #endif
 
-#define DEPTHBOXVDB_ALIGN alignas(16)
+#define CUDA_ALIGN alignas(16)
 
-#endif // !PUBLIC_CUDA_UTIL_H
+	constexpr uint32_t ThreadPerBlockX3D = 8;
+	constexpr uint32_t ThreadPerBlockY3D = 8;
+	constexpr uint32_t ThreadPerBlockZ3D = 8;
+
+	constexpr uint32_t ThreadPerBlockX2D = 16;
+	constexpr uint32_t ThreadPerBlockY2D = 16;
+
+} // namespace CUDA
+
+#endif

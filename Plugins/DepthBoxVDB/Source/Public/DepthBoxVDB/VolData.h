@@ -9,7 +9,7 @@
 
 #include <glm/glm.hpp>
 
-#include <DepthBoxVDB/Util.h>
+#include <CUDA/Util.h>
 
 namespace DepthBoxVDB
 {
@@ -17,6 +17,9 @@ namespace DepthBoxVDB
 	{
 		using CoordValueType = int32_t;
 		using CoordType = glm::vec<3, CoordValueType>;
+
+		static constexpr CoordValueType InvalidCoordValueType =
+			std::numeric_limits<CoordValueType>::max();
 
 		enum class EVoxelType : uint8_t
 		{
@@ -26,7 +29,36 @@ namespace DepthBoxVDB
 			MAX
 		};
 
-		struct DEPTHBOXVDB_ALIGN VDBParameters
+		inline size_t SizeOfVoxelType(EVoxelType VoxelType)
+		{
+			switch (VoxelType)
+			{
+				case EVoxelType::UInt8:
+					return sizeof(uint8_t);
+				case EVoxelType::Float32:
+					return sizeof(float);
+				default:
+					return 0;
+			}
+		}
+
+		inline cudaChannelFormatDesc CUDAChannelDescOfVoxelType(EVoxelType VoxelType)
+		{
+			cudaChannelFormatDesc ChannelDesc{};
+			switch (VoxelType)
+			{
+				case EVoxelType::UInt8:
+					ChannelDesc = cudaCreateChannelDesc<uint8_t>();
+					break;
+				case EVoxelType::Float32:
+					ChannelDesc = cudaCreateChannelDesc<float>();
+					break;
+			}
+
+			return ChannelDesc;
+		}
+
+		struct CUDA_ALIGN VDBParameters
 		{
 			static constexpr int32_t MaxLevelNum = 3;
 			static constexpr int32_t MaxLogChildPerLevel = 9;
@@ -45,16 +77,40 @@ namespace DepthBoxVDB
 			CoordType  InitialVoxelPerAtlas;
 		};
 
+		class IVDBDataProvider
+		{
+		public:
+			struct CreateParameters
+			{
+			};
+			static std::shared_ptr<IVDBDataProvider> Create(const CreateParameters& Params);
+			virtual ~IVDBDataProvider() {}
+
+			struct TransferRAWVolumeToAtlasParameters
+			{
+				CoordType	  VoxelPerVolume;
+				uint8_t*	  RAWVolumeData;
+				VDBParameters VDBParams;
+			};
+			virtual void TransferRAWVolumeToAtlas(
+				const TransferRAWVolumeToAtlasParameters& Params) = 0;
+		};
+
 		class IVDBBuilder
 		{
 		public:
-			static std::unique_ptr<IVDBBuilder> Create();
+			struct CreateParameters
+			{
+			};
+			static std::unique_ptr<IVDBBuilder> Create(const CreateParameters& Params);
 			virtual ~IVDBBuilder() {}
 
 			struct FullBuildParameters
 			{
-				uint8_t*	  RAWVolumeData;
-				VDBParameters VDBParams;
+				uint32_t						  EmptyScalarRangeNum;
+				glm::vec2*						  EmptyScalarRanges;
+				std::shared_ptr<IVDBDataProvider> Provider;
+				VDBParameters					  VDBParams;
 			};
 			virtual void FullBuild(const FullBuildParameters& Params) = 0;
 		};
