@@ -62,7 +62,7 @@ namespace CUDA
 			: CompletenessCheckable(true)
 		{
 			auto chnDesc = ChannelDescOpt.value_or(cudaCreateChannelDesc<T>());
-			if (Dimension.z != 0)
+			if (Dimension.z > 1)
 			{
 				auto Extent = make_cudaExtent(Dimension.x, Dimension.y, Dimension.z);
 				bIsComplete = cudaSuccess == CUDA_CHECK(cudaMalloc3DArray(&Data, &chnDesc, Extent));
@@ -70,8 +70,8 @@ namespace CUDA
 					return;
 
 				cudaMemcpy3DParms Params{};
-				Params.srcPtr =
-					make_cudaPitchedPtr(InData, sizeof(T) * Dimension.x, Dimension.x, Dimension.y);
+				Params.srcPtr = make_cudaPitchedPtr(
+					(void*)InData, sizeof(T) * Dimension.x, Dimension.x, Dimension.y);
 				Params.extent = Extent;
 				Params.dstArray = Data;
 				Params.kind = cudaMemcpyHostToDevice;

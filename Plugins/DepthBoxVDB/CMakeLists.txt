@@ -17,7 +17,9 @@ set(THIRD_PARTY_DIR "${CMAKE_CURRENT_LIST_DIR}/ThirdParty")
 #<glm>
 add_subdirectory("${THIRD_PARTY_DIR}/glm")
 add_definitions("-DGLM_ENABLE_EXPERIMENTAL")
-#<\glm>
+#<dx12>
+add_definitions("-DNOMINMAX")
+#<\dx12>
 #<\dep>
 
 # <lib>

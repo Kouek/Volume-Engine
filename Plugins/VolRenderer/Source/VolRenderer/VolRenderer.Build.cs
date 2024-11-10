@@ -28,6 +28,7 @@ public class VolRenderer : ModuleRules
                 "Core",
                 "RenderCore",
                 "RHI",
+                "UnrealEd",
 				// ... add other public dependencies that you statically link with here ...
                 "VolData"
             }

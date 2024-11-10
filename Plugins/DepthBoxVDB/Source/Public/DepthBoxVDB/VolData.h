@@ -9,6 +9,7 @@
 
 #include <glm/glm.hpp>
 
+#include <DepthBoxVDB/Util.h>
 #include <CUDA/Util.h>
 
 namespace DepthBoxVDB
@@ -18,7 +19,7 @@ namespace DepthBoxVDB
 		using CoordValueType = int32_t;
 		using CoordType = glm::vec<3, CoordValueType>;
 
-		static constexpr CoordValueType InvalidCoordValueType =
+		static constexpr CoordValueType InvalidCoordValue =
 			std::numeric_limits<CoordValueType>::max();
 
 		enum class EVoxelType : uint8_t
@@ -65,44 +66,39 @@ namespace DepthBoxVDB
 
 			EVoxelType VoxelType;
 			int32_t	   RootLevel;
-			int32_t	   ApronWidth = 1;
+			int32_t	   ApronWidth;
 			int32_t	   ApronAndDepthWidth;
-			int32_t	   LogChildPerLevels[MaxLevelNum] = { 5, 4, 3 };
+			int32_t	   LogChildPerLevels[MaxLevelNum];
 			int32_t	   ChildPerLevels[MaxLevelNum];
 			int32_t	   ChildCoverVoxelPerLevels[MaxLevelNum];
-			int32_t	   DepthPositionInAtlasBrick[2];
-			bool	   bUseDepthBox = true;
+			int32_t	   DepthCoordValueInAtlasBrick[2];
 			int32_t	   VoxelPerAtlasBrick;
+			CoordType  VoxelPerVolume;
 			CoordType  BrickPerVolume;
-			CoordType  InitialVoxelPerAtlas;
 		};
 
-		class IVDBDataProvider
+		class IVDBDataProvider : Noncopyable
 		{
 		public:
 			struct CreateParameters
 			{
+				uint8_t*	  RAWVolumeData;
+				glm::vec2*	  EmptyScalarRanges;
+				uint32_t	  EmptyScalarRangeNum;
+				uint32_t	  MaxAllowedGPUMemoryInGB;
+				VDBParameters VDBParams;
 			};
 			static std::shared_ptr<IVDBDataProvider> Create(const CreateParameters& Params);
 			virtual ~IVDBDataProvider() {}
-
-			struct TransferRAWVolumeToAtlasParameters
-			{
-				CoordType	  VoxelPerVolume;
-				uint8_t*	  RAWVolumeData;
-				VDBParameters VDBParams;
-			};
-			virtual void TransferRAWVolumeToAtlas(
-				const TransferRAWVolumeToAtlasParameters& Params) = 0;
 		};
 
-		class IVDBBuilder
+		class IVDBBuilder : Noncopyable
 		{
 		public:
 			struct CreateParameters
 			{
 			};
-			static std::unique_ptr<IVDBBuilder> Create(const CreateParameters& Params);
+			static std::shared_ptr<IVDBBuilder> Create(const CreateParameters& Params);
 			virtual ~IVDBBuilder() {}
 
 			struct FullBuildParameters
@@ -110,7 +106,6 @@ namespace DepthBoxVDB
 				uint32_t						  EmptyScalarRangeNum;
 				glm::vec2*						  EmptyScalarRanges;
 				std::shared_ptr<IVDBDataProvider> Provider;
-				VDBParameters					  VDBParams;
 			};
 			virtual void FullBuild(const FullBuildParameters& Params) = 0;
 		};

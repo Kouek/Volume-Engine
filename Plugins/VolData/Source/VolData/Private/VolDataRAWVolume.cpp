@@ -1,8 +1,9 @@
 #include "VolDataRAWVolume.h"
 
-TVariant<TArray<uint8>, FString> FVolDataRAWVolumeData::LoadFromFile(const LoadFromFileParameters& Params)
+TVariant<FVolDataRAWVolumeData::LoadFromFileParameters::RetValueType, FString> FVolDataRAWVolumeData::LoadFromFile(
+	const LoadFromFileParameters& Params)
 {
-	using RetType = TVariant<TArray<uint8>, FString>;
+	using RetType = TVariant<LoadFromFileParameters::RetValueType, FString>;
 
 	if (Params.VoxelPerVolume.X <= 0 || Params.VoxelPerVolume.Y <= 0 || Params.VoxelPerVolume.Z <= 0)
 		return RetType(TInPlaceType<FString>(),
@@ -52,7 +53,7 @@ TVariant<TArray<uint8>, FString> FVolDataRAWVolumeData::LoadFromFile(const LoadF
 		if (auto ErrMsgOpt = Transform(Dummy); ErrMsgOpt.IsSet())
 			return RetType(TInPlaceType<FString>(), ErrMsgOpt.GetValue());
 
-		return RetType(TInPlaceType<decltype(Buf)>(), Buf);
+		return RetType(TInPlaceType<LoadFromFileParameters::RetValueType>(), Buf);
 	};
 
 	switch (Params.VoxelType)
@@ -66,9 +67,10 @@ TVariant<TArray<uint8>, FString> FVolDataRAWVolumeData::LoadFromFile(const LoadF
 	}
 }
 
-TVariant<UVolumeTexture*, FString> FVolDataRAWVolumeData::CreateTexture(const CreateTextureParameters& Params)
+TVariant<FVolDataRAWVolumeData::CreateTextureParameters::RetValueType, FString> FVolDataRAWVolumeData::CreateTexture(
+	const CreateTextureParameters& Params)
 {
-	using RetType = TVariant<UVolumeTexture*, FString>;
+	using RetType = TVariant<CreateTextureParameters::RetValueType, FString>;
 
 	auto Create = [&]<FVolDataVoxelType T>(T* Dummy) -> RetType {
 		size_t VolSz = sizeof(T) * Params.VoxelPerVolume.X * Params.VoxelPerVolume.Y * Params.VoxelPerVolume.Z;

@@ -4,6 +4,7 @@
 #include <memory>
 
 #include <DepthBoxVDB/VolData.h>
+#include <DepthBoxVDB/Util.h>
 
 namespace DepthBoxVDB
 {
@@ -17,7 +18,25 @@ namespace DepthBoxVDB
 			MAX
 		};
 
-		class IVDBRenderer
+		enum ERenderTarget
+		{
+			Scene = 0,
+			AABB0,
+			MAX
+		};
+
+		struct CUDA_ALIGN VDBRendererParameters
+		{
+			ERenderTarget RenderTarget;
+			int32_t		  MaxStepNum;
+			bool		  bUseDepthBox;
+			bool		  bUsePreIntegratedTF;
+			float		  Step;
+			float		  MaxStepDist;
+			float		  MaxAlpha;
+		};
+
+		class IVDBRenderer : Noncopyable
 		{
 		public:
 			struct CreateParameters
@@ -27,18 +46,31 @@ namespace DepthBoxVDB
 			static std::unique_ptr<IVDBRenderer> Create(const CreateParameters& Params);
 			virtual ~IVDBRenderer() {}
 
-			struct RendererParameters
+			struct RegisterParameters
 			{
 				void* Device;
 				void* InDepthTexture;
 				void* OutColorTexture;
 			};
-			virtual void Register(const RendererParameters& Params) = 0;
+			virtual void Register(const RegisterParameters& Params) = 0;
 			virtual void Unregister() = 0;
+
+			virtual void SetParameters(const VDBRendererParameters& Params) = 0;
+
+			struct TransferFunctionParameters
+			{
+				const float* TransferFunctionData;
+				const float* TransferFunctionDataPreIntegrated;
+				uint32_t	 Resolution;
+			};
+			virtual void SetTransferFunction(const TransferFunctionParameters& Params) = 0;
 
 			struct RenderParameters
 			{
-				bool bUseDepthBox;
+				glm::mat4					InverseProjection;
+				glm::mat3					CameraRotationToLocal;
+				glm::vec3					CameraPositionToLocal;
+				const VolData::IVDBBuilder& Builder;
 			};
 			virtual void Render(const RenderParameters& Params) = 0;
 		};

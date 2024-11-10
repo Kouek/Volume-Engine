@@ -7,6 +7,47 @@
 
 #include "Runtime/Renderer/Private/SceneRendering.h"
 
+TOptional<FString> FVolRendererVDBRendererParameters::InitializeAndCheck(float AspectRatioWOnH)
+{
+	AspectRatioWOnHCached = AspectRatioWOnH;
+
+#define CHECK(Member, Min, Max)                                                 \
+	if (Member < Min || Member > Max)                                           \
+	{                                                                           \
+		return FString::Format(TEXT("Invalid " #Member " = {0}."), { Member }); \
+	}
+
+	CHECK(RenderResolutionY, 100, 10000)
+	RenderResolutionX = FMath::RoundToInt(AspectRatioWOnHCached * RenderResolutionY);
+	CHECK(MaxStepNum, 1, 10000)
+	CHECK(Step, 0.f, std::numeric_limits<float>::max())
+	CHECK(MaxStepDist, 0.f, std::numeric_limits<float>::max())
+	CHECK(MaxAlpha, .1f, 1.f);
+
+#undef CHECK
+
+	return {};
+}
+
+FVolRendererVDBRendererParameters::operator DepthBoxVDB::VolRenderer::VDBRendererParameters()
+{
+	DepthBoxVDB::VolRenderer::VDBRendererParameters Ret;
+
+#define ASSIGN(Member) Ret.Member = Member
+
+	Ret.RenderTarget = (DepthBoxVDB::VolRenderer::ERenderTarget)(uint8)RenderTarget;
+	ASSIGN(bUseDepthBox);
+	ASSIGN(bUsePreIntegratedTF);
+	ASSIGN(MaxStepNum);
+	ASSIGN(Step);
+	ASSIGN(MaxStepDist);
+	ASSIGN(MaxAlpha);
+
+#undef ASSIGN
+
+	return Ret;
+}
+
 class VOLRENDERER_API FDepthDownsamplingCS : public FGlobalShader
 {
 public:
@@ -77,37 +118,78 @@ FVolRendererVDBRenderer::FVolRendererVDBRenderer()
 		{ .RHIType = DepthBoxVDB::VolRenderer::CastFromRHIInterfaceType(GDynamicRHI->GetInterfaceType()) });
 }
 
-FVolRendererVDBRenderer::~FVolRendererVDBRenderer()
-{
-	unregister();
-}
+FVolRendererVDBRenderer::~FVolRendererVDBRenderer() {}
 
 void FVolRendererVDBRenderer::Register()
 {
-	unregister();
+	Unregister();
 
 	ENQUEUE_RENDER_COMMAND(UnregisterRenderScreenRenderer)
 	([Renderer = SharedThis(this)](FRHICommandListImmediate& RHICmdList) {
-		GetRendererModule().RegisterPostOpaqueRenderDelegate(
+		Renderer->OnPostOpaqueRender = GetRendererModule().RegisterPostOpaqueRenderDelegate(
 			FPostOpaqueRenderDelegate::CreateRaw(&Renderer.Get(), &FVolRendererVDBRenderer::Render_RenderThread));
+	});
+}
+
+void FVolRendererVDBRenderer::Unregister()
+{
+	if (!OnPostOpaqueRender.IsValid())
+		return;
+
+	ENQUEUE_RENDER_COMMAND(UnregisterRenderScreenRenderer)
+	([Renderer = SharedThis(this)](FRHICommandListImmediate& RHICmdList) {
+		GetRendererModule().RemovePostOpaqueRenderDelegate(Renderer->OnPostOpaqueRender);
+		Renderer->OnPostOpaqueRender.Reset();
+		Renderer->Unregister();
+	});
+}
+
+void FVolRendererVDBRenderer::SetVDBBuilder(std::shared_ptr<DepthBoxVDB::VolData::IVDBBuilder> InVDBBuilder)
+{
+	ENQUEUE_RENDER_COMMAND(SetVDBBuilder)
+	([Renderer = SharedThis(this), InVDBBuilder](
+		 FRHICommandListImmediate& RHICmdList) { Renderer->VDBBuilder = InVDBBuilder; });
+}
+
+void FVolRendererVDBRenderer::SetTransferFunction(
+	const TArray<float>& InTransferFunctionData, const TArray<float>& InTransferFunctionDataPreIntegrated)
+{
+	TransferFunctionData = InTransferFunctionData;
+	TransferFunctionDataPreIntegrated = InTransferFunctionDataPreIntegrated;
+
+	ENQUEUE_RENDER_COMMAND(SetTransferFunction)
+	([Renderer = SharedThis(this)](FRHICommandListImmediate& RHICmdList) {
+		if (!Renderer->VDBRenderer)
+			return;
+
+		VolRenderer::FStdOutputLinker Linker;
+		Renderer->VDBRenderer->SetTransferFunction({ .TransferFunctionData = Renderer->TransferFunctionData.GetData(),
+			.TransferFunctionDataPreIntegrated = Renderer->TransferFunctionDataPreIntegrated.GetData(),
+			.Resolution = static_cast<uint32>(Renderer->TransferFunctionData.Num() / 4) /* float32 RGBA */ });
 	});
 }
 
 void FVolRendererVDBRenderer::SetParameters(const FVolRendererVDBRendererParameters& Params)
 {
-	VDBRendererParams = Params;
+	ENQUEUE_RENDER_COMMAND(SetParameters)
+	([Renderer = SharedThis(this), Params](FRHICommandListImmediate& RHICmdList) {
+		if (!Renderer->VDBRenderer)
+			return;
+
+		Renderer->VDBRendererParams = Params;
+		VolRenderer::FStdOutputLinker Linker;
+		Renderer->VDBRenderer->SetParameters(Renderer->VDBRendererParams);
+	});
 }
 
 void FVolRendererVDBRenderer::Render_RenderThread(FPostOpaqueRenderParameters& Params)
 {
-	if (!VDBRenderer)
+	if (!VDBRenderer || !VDBBuilder)
 		return;
 
 	auto* GraphBuilder = Params.GraphBuilder;
 	auto& RHICmdList = GraphBuilder->RHICmdList;
 
-	void*	  InDepthTextureNative = nullptr;
-	void*	  OutVolumeColorTextureNative = nullptr;
 	FIntPoint VolumeRenderResolution =
 		FIntPoint(VDBRendererParams.RenderResolutionX, VDBRendererParams.RenderResolutionY);
 	{
@@ -138,10 +220,11 @@ void FVolRendererVDBRenderer::Render_RenderThread(FPostOpaqueRenderParameters& P
 			bNeedRegister = true;
 		}
 
-		InDepthTextureNative = DepthTexture->GetNativeResource();
-		OutVolumeColorTextureNative = VolumeColorTexture->GetNativeResource();
+		void* InDepthTextureNative = DepthTexture->GetNativeResource();
+		void* OutVolumeColorTextureNative = VolumeColorTexture->GetNativeResource();
 		if (bNeedRegister)
 		{
+			VolRenderer::FStdOutputLinker Linker;
 			VDBRenderer->Register({ .Device = GDynamicRHI->RHIGetNativeDevice(),
 				.InDepthTexture = InDepthTextureNative,
 				.OutColorTexture = OutVolumeColorTextureNative });
@@ -173,10 +256,49 @@ void FVolRendererVDBRenderer::Render_RenderThread(FPostOpaqueRenderParameters& P
 		ShaderParams->OutVolumeColorTexture = VolumeColorTextureRDGUAV;
 
 		auto ShaderParametersMetadata = FBarrierShaderParameters::FTypeInfo::GetStructMetadata();
+
+		/*
+		 * | 0 1 0|   |x|   | y|
+		 * | 0 0 1| * |y| = | z|
+		 * |-1 0 0|   |z|L  |-x|R
+		 */
+		auto AssignLeftHandedToRight = [](glm::vec3& Rht, const FVector& Lft) {
+			Rht.x = +Lft.Y;
+			Rht.y = +Lft.Z;
+			Rht.z = -Lft.X;
+		};
+		glm::vec3 CameraPositionToLoacl;
+		{
+			const FVector& CameraPos = Params.View->ViewMatrices.GetViewOrigin();
+			AssignLeftHandedToRight(CameraPositionToLoacl, CameraPos);
+		}
+
+		glm::mat3 CameraRotationToLoacl;
+		{
+			AssignLeftHandedToRight(CameraRotationToLoacl[2], Params.View->GetViewDirection());
+			CameraRotationToLoacl[2] *= -1.f;
+			AssignLeftHandedToRight(CameraRotationToLoacl[0], Params.View->GetViewRight());
+			AssignLeftHandedToRight(CameraRotationToLoacl[1], Params.View->GetViewUp());
+		}
+
+		const FMatrix& InvProjMatrix = Params.View->ViewMatrices.GetInvProjectionMatrix();
+		glm::mat4	   InverseProjection(InvProjMatrix.M[0][0], InvProjMatrix.M[0][1], InvProjMatrix.M[0][2],
+				 InvProjMatrix.M[0][3], InvProjMatrix.M[1][0], InvProjMatrix.M[1][1], InvProjMatrix.M[1][2],
+				 InvProjMatrix.M[1][3], InvProjMatrix.M[2][0], InvProjMatrix.M[2][1], InvProjMatrix.M[2][2],
+				 InvProjMatrix.M[2][3], InvProjMatrix.M[3][0], InvProjMatrix.M[3][1], -InvProjMatrix.M[3][2],
+				 InvProjMatrix.M[3][3]);
+
 		GraphBuilder->AddPass(RDG_EVENT_NAME("Volume Rendering"), ShaderParametersMetadata, ShaderParams,
 			ERDGPassFlags::AsyncCompute | ERDGPassFlags::NeverCull,
-			[DepthTexture = DepthTexture, VolumeColorTexture = VolumeColorTexture, VDBRenderer = VDBRenderer.get()](
-				FRHICommandListImmediate& RHICmdList) { VDBRenderer->Render({ .bUseDepthBox = true }); });
+			[InverseProjection, CameraRotationToLoacl, CameraPositionToLoacl, DepthTexture = DepthTexture,
+				VolumeColorTexture = VolumeColorTexture, VDBRenderer = VDBRenderer.get(),
+				VDBBuilder = VDBBuilder.get()](FRHICommandListImmediate& RHICmdList) {
+				VolRenderer::FStdOutputLinker Linker;
+				VDBRenderer->Render({ .InverseProjection = InverseProjection,
+					.CameraRotationToLocal = CameraRotationToLoacl,
+					.CameraPositionToLocal = CameraPositionToLoacl,
+					.Builder = *VDBBuilder });
+			});
 	}
 
 	{
@@ -193,16 +315,4 @@ void FVolRendererVDBRenderer::Render_RenderThread(FPostOpaqueRenderParameters& P
 				FMath::DivideAndRoundUp(ShaderParams->RenderResolution.X, FDepthDownsamplingCS::ThreadPerGroup[0]),
 				FMath::DivideAndRoundUp(ShaderParams->RenderResolution.Y, FDepthDownsamplingCS::ThreadPerGroup[1]), 1));
 	}
-}
-
-void FVolRendererVDBRenderer::unregister()
-{
-	if (!OnPostOpaqueRender.IsValid())
-		return;
-
-	ENQUEUE_RENDER_COMMAND(UnregisterRenderScreenRenderer)
-	([Renderer = SharedThis(this)](FRHICommandListImmediate& RHICmdList) {
-		GetRendererModule().RemovePostOpaqueRenderDelegate(Renderer->OnPostOpaqueRender);
-		Renderer->OnPostOpaqueRender.Reset();
-	});
 }

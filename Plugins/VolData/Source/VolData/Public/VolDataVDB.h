@@ -14,6 +14,8 @@ struct FVolDataVDBCPUData
 	FIntVector		  VoxelPerVolume;
 	uint32			  EmptyScalarRangeNum;
 	TArray<uint8>	  RAWVolumeData;
+	TArray<float>	  TransferFunctionData;
+	TArray<float>	  TransferFunctionDataPreIntegrated;
 	TArray<glm::vec2> EmptyScalarRanges;
 
 	bool IsComplete() const { return !RAWVolumeData.IsEmpty() && !EmptyScalarRanges.IsEmpty(); }
@@ -31,10 +33,10 @@ struct FVolDataVDBParameters
 	EVolDataVoxelType VoxelType;
 	UPROPERTY(VisibleAnywhere)
 	int32 RootLevel = 0;
-	UPROPERTY(EditAnywhere)
+	UPROPERTY(VisibleAnywhere)
 	int32 ApronWidth = 1;
 	UPROPERTY(VisibleAnywhere)
-	int32 ApronAndDepthWidth = 1;
+	int32 ApronAndDepthWidth = 2;
 	UPROPERTY(EditAnywhere)
 	int32 LogChildPerLevels[MaxLevelNum] = { 5, 4, 3 };
 	int32 LogChildAtLevelZeroCached = 0;
@@ -43,19 +45,19 @@ struct FVolDataVDBParameters
 	UPROPERTY(VisibleAnywhere)
 	int32 ChildCoverVoxelPerLevels[MaxLevelNum] = { 1, 32, 32 * 16 };
 	UPROPERTY(VisibleAnywhere)
-	int32 DepthPositionInAtlasBrick[2] = { -1, 32 };
-	UPROPERTY(EditAnywhere)
-	bool bUseDepthBox = true;
+	int32 DepthCoordValueInAtlasBrick[2] = { -1, 32 };
 	UPROPERTY(VisibleAnywhere)
 	int32 VoxelPerAtlasBrick = 34;
 	UPROPERTY(VisibleAnywhere)
 	FIntVector BrickPerVolume = { 0, 0, 0 };
 	UPROPERTY(EditAnywhere)
-	int32 MaxAllowedGPUMemoryInGB = 2;
+	uint32 MaxAllowedGPUMemoryInGB = 2;
 	UPROPERTY(VisibleAnywhere)
 	FIntVector InitialVoxelPerAtlas{ 0, 0, 0 };
+	UPROPERTY(VisibleAnywhere)
+	FIntVector VoxelPerVolume{ 0, 0, 0 };
 
-	TOptional<FString> InitializeAndCheck(const FIntVector3& VoxelPerVolume, EVolDataVoxelType InVoxelType);
+	TOptional<FString> InitializeAndCheck(const FIntVector3& InVoxelPerVolume, EVolDataVoxelType InVoxelType);
 
 	operator DepthBoxVDB::VolData::VDBParameters();
 };
@@ -96,8 +98,14 @@ class VOLDATA_API UVolDataVDBComponent : public UActorComponent
 	GENERATED_BODY()
 
 public:
+	UVolDataVDBComponent(const FObjectInitializer&);
+
 	UPROPERTY(EditAnywhere, Category = "VolData")
 	FVolDataVDBParameters VDBParams;
+	UPROPERTY(VisibleAnywhere, Transient, Category = "VolData")
+	UTexture2D* TransferFunction = nullptr;
+	UPROPERTY(VisibleAnywhere, Transient, Category = "VolData")
+	UTexture2D* TransferFunctionPreIntegrated = nullptr;
 
 	UPROPERTY(EditAnywhere, Category = "VolData")
 	FVolDataLoadRAWVolumeParameters LoadRAWVolumeParams;
@@ -111,15 +119,24 @@ public:
 
 	void PostLoad() override;
 
-	void BuildVDB(bool bNeedReload = false, bool bNeedRelayoutAtlas = false);
+	std::shared_ptr<DepthBoxVDB::VolData::IVDBBuilder> GetVDBBuilder() const { return VDBBuilder; }
+	TSharedPtr<FVolDataVDBCPUData>					   GetCPUData() const { return CPUData; }
+
+	DECLARE_MULTICAST_DELEGATE_OneParam(FOnTransferFunctionChanged, UVolDataVDBComponent*);
+
+	FOnTransferFunctionChanged OnTransferFunctionChanged;
 
 #if WITH_EDITOR
 	void PostEditChangeProperty(struct FPropertyChangedEvent& PropertyChangedEvent) override;
 #endif
 
 private:
+	void setupTransferFunction(bool bNeedReload = false);
+	void buildVDB(bool bNeedReload = false, bool bNeedRelayoutAtlas = false);
+
+private:
 	TSharedPtr<FVolDataVDBCPUData> CPUData;
 
 	std::shared_ptr<DepthBoxVDB::VolData::IVDBDataProvider> VDBDataProvider;
-	std::unique_ptr<DepthBoxVDB::VolData::IVDBBuilder>		VDBBuilder;
+	std::shared_ptr<DepthBoxVDB::VolData::IVDBBuilder>		VDBBuilder;
 };

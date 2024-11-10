@@ -11,18 +11,23 @@ class FVolDataRAWVolumeData
 public:
 	struct LoadFromFileParameters
 	{
+		using RetValueType = TArray<uint8>;
+
 		EVolDataVoxelType VoxelType;
 		FIntVector3		  VoxelPerVolume;
 		FIntVector3		  AxisOrder;
 		FFilePath		  SourcePath;
 	};
-	static TVariant<TArray<uint8>, FString> LoadFromFile(const LoadFromFileParameters& Params);
+	static TVariant<LoadFromFileParameters::RetValueType, FString> LoadFromFile(const LoadFromFileParameters& Params);
 
 	struct CreateTextureParameters
 	{
+		using RetValueType = UVolumeTexture*;
+
 		EVolDataVoxelType	 VoxelType;
 		FIntVector3			 VoxelPerVolume;
 		const TArray<uint8>& RAWVolumeData;
 	};
-	static TVariant<UVolumeTexture*, FString> CreateTexture(const CreateTextureParameters& Params);
+	static TVariant<CreateTextureParameters::RetValueType, FString> CreateTexture(
+		const CreateTextureParameters& Params);
 };

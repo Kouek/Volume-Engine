@@ -6,6 +6,7 @@
 #include <memory>
 
 #include <array>
+#include <unordered_map>
 
 #include <thrust/device_vector.h>
 
@@ -15,6 +16,11 @@
 
 namespace DepthBoxVDB
 {
+	namespace VolRenderer
+	{
+		class VDBRenderer;
+	}
+
 	namespace VolData
 	{
 		struct CUDA_ALIGN VDBNode
@@ -23,10 +29,9 @@ namespace DepthBoxVDB
 			CoordType CoordInAtlas;
 			uint64_t  ChildListOffset;
 
-			__host__ __device__ static constexpr VDBNode Invalid()
+			__host__ __device__ static VDBNode CreateInvalid()
 			{
-				VDBNode Ret{ CoordType(std::numeric_limits<CoordValueType>::max()),
-					CoordType(std::numeric_limits<CoordValueType>::max()),
+				VDBNode Ret{ CoordType(InvalidCoordValue), CoordType(InvalidCoordValue),
 					std::numeric_limits<uint64_t>::max() };
 				return Ret;
 			}
@@ -34,10 +39,7 @@ namespace DepthBoxVDB
 
 		struct CUDA_ALIGN VDBData
 		{
-			static constexpr uint32_t InvalidChild()
-			{
-				return std::numeric_limits<uint32_t>::max();
-			}
+			static constexpr uint32_t InvalidChild = std::numeric_limits<uint32_t>::max();
 
 			VDBNode*  NodePerLevels[VDBParameters::MaxLevelNum] = { nullptr };
 			uint32_t* ChildPerLevels[VDBParameters::MaxLevelNum - 1] = { nullptr };
@@ -63,12 +65,18 @@ namespace DepthBoxVDB
 			}
 			__host__ __device__ VDBNode& Node(int32_t Level, const CoordType& Coord) const
 			{
-				return NodePerLevels[Level][Index(Level, Coord)];
+				return Node(Level, Index(Level, Coord));
 			}
 			__host__ __device__ uint32_t& Child(
 				int32_t ParentLevel, uint32_t ChildIndexInParent, const VDBNode& Parent) const
 			{
 				return ChildPerLevels[ParentLevel - 1][Parent.ChildListOffset + ChildIndexInParent];
+			}
+			__host__ __device__ uint32_t& Child(int32_t ParentLevel,
+				const CoordType& ChildCoordInParent, const VDBNode& Parent) const
+			{
+				return Child(
+					ParentLevel, ChildIndexInParent(ParentLevel, ChildCoordInParent), Parent);
 			}
 
 			__host__ __device__ CoordType CoordInParentLevel(
@@ -101,26 +109,38 @@ namespace DepthBoxVDB
 
 		class VDBBuilder;
 
-		class VDBDataProvider : public IVDBDataProvider
+		class VDBProvider : public IVDBDataProvider
 		{
 		public:
-			VDBDataProvider(const CreateParameters& Params);
-			~VDBDataProvider();
-
-			void TransferRAWVolumeToAtlas(
-				const TransferRAWVolumeToAtlasParameters& Params) override;
+			VDBProvider(const CreateParameters& Params);
+			~VDBProvider();
 
 		private:
-			void resizeAtlasArray(const VDBParameters& Params);
+			void relayoutRAWVolume(const CreateParameters& Params);
+			void resizeAtlas();
+			void updateAtlas();
 
 		private:
+			uint32_t	 ValidBrickNum = 0;
+			uint32_t	 MaxAllowedGPUMemoryInGB;
+			CoordType	 BrickPerAtlas;
 			cudaStream_t Stream = 0;
+
+			VDBParameters VDBParams;
 
 			std::shared_ptr<CUDA::Array>   AtlasArray;
 			std::unique_ptr<CUDA::Texture> AtlasTexture;
 			std::unique_ptr<CUDA::Surface> AtlasSurface;
 
+			std::vector<uint8_t> BrickedData;
+
+			std::vector<CoordType>			 AtlasBrickToBrick;
+			std::vector<CoordType>			 BrickToAtlasBrick;
+			thrust::device_vector<CoordType> dAtlasBrickToBrick;
+			thrust::device_vector<CoordType> dBrickToAtlasBrick;
+
 			friend class VDBBuilder;
+			friend class VolRenderer::VDBRenderer;
 		};
 
 		class VDBBuilder : public IVDBBuilder
@@ -131,14 +151,18 @@ namespace DepthBoxVDB
 
 			void FullBuild(const FullBuildParameters& Params) override;
 
+			VDBData* GetDeviceData() const;
+
 		private:
 			cudaStream_t Stream = 0;
 			VDBData*	 dData = nullptr;
 
-			std::shared_ptr<VDBDataProvider> Provider;
+			std::shared_ptr<VDBProvider> Provider;
 
 			std::array<thrust::device_vector<VDBNode>, VDBParameters::MaxLevelNum>	dNodePerLevels;
 			std::array<thrust::device_vector<uint32_t>, VDBParameters::MaxLevelNum> dChildPerLevels;
+
+			friend class VolRenderer::VDBRenderer;
 		};
 
 	} // namespace VolData

@@ -1,5 +1,5 @@
-#ifndef PUBLIC_DEPTHBOXVDB_UTIL_H
-#define PUBLIC_DEPTHBOXVDB_UTIL_H
+#ifndef PUBLIC_CUDA_UTIL_H
+#define PUBLIC_CUDA_UTIL_H
 
 #include <iostream>
 #include <format>
@@ -15,11 +15,12 @@
 namespace CUDA
 {
 
-	inline cudaError_t Check(cudaError_t Err)
+	inline cudaError_t Check(cudaError_t Err, const char* FileName, int Line)
 	{
 		if (Err == cudaSuccess)
 			return cudaSuccess;
-		auto ErrMsg = std::format("{}: {}\n", cudaGetErrorName(Err), cudaGetErrorString(Err));
+		auto ErrMsg = std::format(
+			"{} at {}:{}: {}\n", cudaGetErrorName(Err), FileName, Line, cudaGetErrorString(Err));
 		std::cerr << ErrMsg;
 		return Err;
 	}
@@ -45,7 +46,7 @@ namespace CUDA
 #ifdef RELEASE
 	#define CUDA_CHECK(Call) Call
 #else
-	#define CUDA_CHECK(Call) CUDA::Check(Call)
+	#define CUDA_CHECK(Call) CUDA::Check(Call, __FILE__, __LINE__)
 #endif
 
 #define CUDA_ALIGN alignas(16)
@@ -56,6 +57,8 @@ namespace CUDA
 
 	constexpr uint32_t ThreadPerBlockX2D = 16;
 	constexpr uint32_t ThreadPerBlockY2D = 16;
+
+	constexpr uint32_t ThreadPerBlockX1D = 32;
 
 } // namespace CUDA
 

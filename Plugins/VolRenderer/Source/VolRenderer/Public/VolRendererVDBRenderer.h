@@ -2,6 +2,8 @@
 
 #include "CoreMinimal.h"
 
+#include <atomic>
+
 #include "VolRendererUtil.h"
 #include "VolDataVDB.h"
 
@@ -27,42 +29,42 @@ namespace DepthBoxVDB
 	} // namespace VolRenderer
 } // namespace DepthBoxVDB
 
+UENUM()
+enum class EVolRendererRenderTarget : uint8
+{
+	Scene = 0 UMETA(DisplayName = "Volume Scenen"),
+	AABB0 UMETA(DisplayName = "AABB of Level 0")
+};
+
 USTRUCT()
 struct FVolRendererVDBRendererParameters
 {
 	GENERATED_BODY()
 
 	UPROPERTY(EditAnywhere)
-	int RenderResolutionY = 100;
+	EVolRendererRenderTarget RenderTarget = EVolRendererRenderTarget::Scene;
+	UPROPERTY(EditAnywhere)
+	bool bUseDepthBox = false;
+	UPROPERTY(EditAnywhere)
+	bool bUsePreIntegratedTF = true;
+	UPROPERTY(EditAnywhere)
+	int32 RenderResolutionY = 640;
 	UPROPERTY(VisibleAnywhere)
-	int RenderResolutionX;
+	int32 RenderResolutionX;
 	UPROPERTY(EditAnywhere)
-	int MaxStepNum = 3000;
+	int32 MaxStepNum = 3000;
 	UPROPERTY(EditAnywhere)
-	float Step = .5f / 3000;
+	float Step = .333f;
 	UPROPERTY(EditAnywhere)
 	float MaxStepDist = 1000.f;
-	UPROPERTY(VisibleAnywhere)
-	FMatrix VolumeToWorld;
+	UPROPERTY(EditAnywhere)
+	float MaxAlpha = .95f;
 
-	TOptional<FString> InitializeAndCheck(float AspectRatioWOnH)
-	{
-#define CHECK(Member, Min, Max)                                                 \
-	if (Member < Min || Member > Max)                                           \
-	{                                                                           \
-		return FString::Format(TEXT("Invalid " #Member " = {0}."), { Member }); \
-	}
+	float AspectRatioWOnHCached = 1.f;
 
-		CHECK(RenderResolutionY, 100, 10000)
-		RenderResolutionX = FMath::RoundToInt(AspectRatioWOnH * RenderResolutionY);
-		CHECK(MaxStepNum, 1, 10000)
-		CHECK(Step, 0.f, std::numeric_limits<float>::max())
-		CHECK(MaxStepDist, 0.f, std::numeric_limits<float>::max())
+	TOptional<FString> InitializeAndCheck(float AspectRatioWOnH);
 
-#undef CHECK
-
-		return {};
-	}
+	operator DepthBoxVDB::VolRenderer::VDBRendererParameters();
 };
 
 class VOLRENDERER_API FVolRendererVDBRenderer : public TSharedFromThis<FVolRendererVDBRenderer>
@@ -72,17 +74,23 @@ public:
 	~FVolRendererVDBRenderer();
 
 	void Register();
+	void Unregister();
+	void SetVDBBuilder(std::shared_ptr<DepthBoxVDB::VolData::IVDBBuilder> InVDBBuilder);
+	void SetTransferFunction(
+		const TArray<float>& InTransferFunctionData, const TArray<float>& InTransferFunctionDataPreIntegrated);
 	void SetParameters(const FVolRendererVDBRendererParameters& Params);
 	void Render_RenderThread(FPostOpaqueRenderParameters& Params);
 
 private:
-	void unregister();
+	FTextureRHIRef DepthTexture;
+	FTextureRHIRef VolumeColorTexture;
 
-private:
-	FTextureRHIRef	DepthTexture;
-	FTextureRHIRef	VolumeColorTexture;
 	FDelegateHandle OnPostOpaqueRender;
 
+	TArray<float> TransferFunctionData;
+	TArray<float> TransferFunctionDataPreIntegrated;
+
+	std::shared_ptr<DepthBoxVDB::VolData::IVDBBuilder>		VDBBuilder;
 	std::unique_ptr<DepthBoxVDB::VolRenderer::IVDBRenderer> VDBRenderer;
 
 	FVolRendererVDBRendererParameters VDBRendererParams;
