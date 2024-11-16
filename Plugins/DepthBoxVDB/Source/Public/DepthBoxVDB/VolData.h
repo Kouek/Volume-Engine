@@ -77,21 +77,6 @@ namespace DepthBoxVDB
 			CoordType  BrickPerVolume;
 		};
 
-		class IVDBDataProvider : Noncopyable
-		{
-		public:
-			struct CreateParameters
-			{
-				uint8_t*	  RAWVolumeData;
-				glm::vec2*	  EmptyScalarRanges;
-				uint32_t	  EmptyScalarRangeNum;
-				uint32_t	  MaxAllowedGPUMemoryInGB;
-				VDBParameters VDBParams;
-			};
-			static std::shared_ptr<IVDBDataProvider> Create(const CreateParameters& Params);
-			virtual ~IVDBDataProvider() {}
-		};
-
 		class IVDBBuilder : Noncopyable
 		{
 		public:
@@ -103,11 +88,20 @@ namespace DepthBoxVDB
 
 			struct FullBuildParameters
 			{
-				uint32_t						  EmptyScalarRangeNum;
-				glm::vec2*						  EmptyScalarRanges;
-				std::shared_ptr<IVDBDataProvider> Provider;
+				uint8_t*		 RAWVolumeData;
+				const glm::vec2* EmptyScalarRanges;
+				uint32_t		 EmptyScalarRangeNum;
+				uint32_t		 MaxAllowedGPUMemoryInGB;
+				VDBParameters	 VDBParams;
 			};
 			virtual void FullBuild(const FullBuildParameters& Params) = 0;
+
+			struct UpdateDepthBoxParameters
+			{
+				const glm::vec2* EmptyScalarRanges;
+				uint32_t		 EmptyScalarRangeNum;
+			};
+			virtual void UpdateDepthBoxAsync(const UpdateDepthBoxParameters& Params) = 0;
 		};
 
 	} // namespace VolData

@@ -19,7 +19,7 @@ TOptional<FString> FVolDataVDBParameters::InitializeAndCheck(
 
 	for (int32 i = 0; i < MaxLevelNum; ++i)
 	{
-		CHECK(LogChildPerLevels[i], 1, MaxLogChildPerLevel);
+		CHECK(LogChildPerLevels[i], 2, MaxLogChildPerLevel);
 	}
 	CHECK(MaxAllowedGPUMemoryInGB, 1, 64);
 
@@ -162,7 +162,7 @@ void UVolDataVDBComponent::PostEditChangeProperty(FPropertyChangedEvent& Propert
 {
 	if (PropertyChangedEvent.GetMemberPropertyName() == GET_MEMBER_NAME_CHECKED(UVolDataVDBComponent, VDBParams))
 	{
-		if (PropertyChangedEvent.GetPropertyName() == GET_MEMBER_NAME_CHECKED(FVolDataVDBParameters, ChildPerLevels))
+		if (PropertyChangedEvent.GetPropertyName() == GET_MEMBER_NAME_CHECKED(FVolDataVDBParameters, LogChildPerLevels))
 		{
 			buildVDB(false, VDBParams.LogChildAtLevelZeroCached != VDBParams.LogChildPerLevels[0]);
 		}
@@ -189,7 +189,8 @@ void UVolDataVDBComponent::setupTransferFunction(bool bNeedReload)
 		UE_LOG(LogVolData, Error, TEXT("%s"), *DataOrErrMsg.Get<FString>());
 		return;
 	}
-	auto& Data = DataOrErrMsg.Get<TArray<FFloat16>>();
+	auto&					 Data = DataOrErrMsg.Get<TArray<FFloat16>>();
+	std::array<FFloat16, 4>* TypedData = reinterpret_cast<std::array<FFloat16, 4>*>(Data.GetData());
 
 	{
 		uint32_t EmptyRange[2] = { LoadTransferFunctionParameters.Resolution, 0 };
@@ -201,7 +202,8 @@ void UVolDataVDBComponent::setupTransferFunction(bool bNeedReload)
 		};
 		for (uint32 Scalar = 0; Scalar < LoadTransferFunctionParameters.Resolution; ++Scalar)
 		{
-			bool bCurrEmpty = Data[Scalar] <= std::numeric_limits<float>::epsilon();
+			std::array<FFloat16, 4>& RGBA = TypedData[Scalar];
+			bool					 bCurrEmpty = RGBA[3] <= std::numeric_limits<float>::epsilon();
 			if (bCurrEmpty)
 			{
 				EmptyRange[0] = std::min(Scalar, EmptyRange[0]);
@@ -253,7 +255,7 @@ void UVolDataVDBComponent::setupTransferFunction(bool bNeedReload)
 void UVolDataVDBComponent::buildVDB(bool bNeedReload, bool bNeedRelayoutAtlas)
 {
 	// Temporarily support RAW Volume only
-	bool bNeedRecreateVDBProvider = bNeedRelayoutAtlas;
+	bool bNeedFullRebuild = bNeedRelayoutAtlas;
 	if (bNeedReload || LoadRAWVolumeParams.bNeedReload)
 	{
 		CPUData->RAWVolumeData.Empty();
@@ -275,7 +277,7 @@ void UVolDataVDBComponent::buildVDB(bool bNeedReload, bool bNeedRelayoutAtlas)
 				.Get<1>();
 
 		LoadRAWVolumeParams.bNeedReload = false;
-		bNeedRecreateVDBProvider = true;
+		bNeedFullRebuild = true;
 	}
 
 	if (!CPUData->IsComplete())
@@ -293,19 +295,15 @@ void UVolDataVDBComponent::buildVDB(bool bNeedReload, bool bNeedRelayoutAtlas)
 		}
 	}
 
-	AsyncTask(ENamedThreads::Type::AnyThread, [this, bNeedRecreateVDBProvider]() {
-		VolData::FStdOutputLinker Linker;
-		if (bNeedRecreateVDBProvider)
-		{
-			VDBDataProvider =
-				DepthBoxVDB::VolData::IVDBDataProvider::Create({ .RAWVolumeData = CPUData->RAWVolumeData.GetData(),
-					.EmptyScalarRanges = CPUData->EmptyScalarRanges.GetData(),
-					.EmptyScalarRangeNum = CPUData->EmptyScalarRangeNum,
-					.MaxAllowedGPUMemoryInGB = VDBParams.MaxAllowedGPUMemoryInGB,
-					.VDBParams = VDBParams });
-		}
-		VDBBuilder->FullBuild({ .EmptyScalarRangeNum = CPUData->EmptyScalarRangeNum,
-			.EmptyScalarRanges = CPUData->EmptyScalarRanges.GetData(),
-			.Provider = VDBDataProvider });
-	});
+	if (bNeedFullRebuild)
+	{
+		AsyncTask(ENamedThreads::Type::ActualRenderingThread, [this]() {
+			VolData::FStdOutputLinker Linker;
+			VDBBuilder->FullBuild({ .RAWVolumeData = CPUData->RAWVolumeData.GetData(),
+				.EmptyScalarRanges = CPUData->EmptyScalarRanges.GetData(),
+				.EmptyScalarRangeNum = CPUData->EmptyScalarRangeNum,
+				.MaxAllowedGPUMemoryInGB = VDBParams.MaxAllowedGPUMemoryInGB,
+				.VDBParams = VDBParams });
+		});
+	}
 }

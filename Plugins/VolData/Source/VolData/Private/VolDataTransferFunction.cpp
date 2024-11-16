@@ -32,7 +32,7 @@ FVolDataTransferFunction::LoadFromFile(const LoadFromFileParameters<bUseHalf>& P
 				FString::Format(
 					TEXT("Invalid contents at line {0} in SourcePath {1}."), { Line + 1, Params.SourcePath.FilePath }));
 
-		auto& RGBA = Points.Emplace(LineVars[0]);
+		auto& RGBA = Points.Emplace(std::clamp(std::roundf(LineVars[0]), 0.f, static_cast<float>(Params.Resolution)));
 		for (int CmpIdx = 0; CmpIdx < 4; ++CmpIdx)
 			RGBA[CmpIdx] = std::min(std::max(LineVars[CmpIdx + 1] / 255.f, 0.f), 1.f);
 	}

@@ -22,6 +22,9 @@ namespace DepthBoxVDB
 		{
 			Scene = 0,
 			AABB0,
+			AABB1,
+			AABB2,
+			DepthBox,
 			MAX
 		};
 

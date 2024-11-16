@@ -33,7 +33,10 @@ UENUM()
 enum class EVolRendererRenderTarget : uint8
 {
 	Scene = 0 UMETA(DisplayName = "Volume Scenen"),
-	AABB0 UMETA(DisplayName = "AABB of Level 0")
+	AABB0	 UMETA(DisplayName = "AABB of Level 0"),
+	AABB1	 UMETA(DisplayName = "AABB of Level 1"),
+	AABB2	 UMETA(DisplayName = "AABB of Level 2"),
+	DepthBox UMETA(DisplayName = "Depth Box")
 };
 
 USTRUCT()

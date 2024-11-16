@@ -140,7 +140,7 @@ void FVolRendererVDBRenderer::Unregister()
 	([Renderer = SharedThis(this)](FRHICommandListImmediate& RHICmdList) {
 		GetRendererModule().RemovePostOpaqueRenderDelegate(Renderer->OnPostOpaqueRender);
 		Renderer->OnPostOpaqueRender.Reset();
-		Renderer->Unregister();
+		Renderer->VDBRenderer->Unregister();
 	});
 }
 

@@ -30,7 +30,7 @@ struct FVolDataVDBParameters
 	static constexpr int32 MaxLogChildPerLevel = 9;
 
 	UPROPERTY(VisibleAnywhere)
-	EVolDataVoxelType VoxelType;
+	EVolDataVoxelType VoxelType = EVolDataVoxelType::None;
 	UPROPERTY(VisibleAnywhere)
 	int32 RootLevel = 0;
 	UPROPERTY(VisibleAnywhere)
@@ -137,6 +137,5 @@ private:
 private:
 	TSharedPtr<FVolDataVDBCPUData> CPUData;
 
-	std::shared_ptr<DepthBoxVDB::VolData::IVDBDataProvider> VDBDataProvider;
-	std::shared_ptr<DepthBoxVDB::VolData::IVDBBuilder>		VDBBuilder;
+	std::shared_ptr<DepthBoxVDB::VolData::IVDBBuilder> VDBBuilder;
 };

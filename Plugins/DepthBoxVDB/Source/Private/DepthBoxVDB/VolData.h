@@ -49,24 +49,11 @@ namespace DepthBoxVDB
 
 			VDBParameters VDBParams;
 
-			__host__ __device__ uint32_t Index(int32_t Level, const CoordType& Coord) const
-			{
-				if (Level == VDBParams.RootLevel)
-					return 0;
-
-				int32_t ChildCurrLev = VDBParams.ChildPerLevels[Level + 1];
-				return static_cast<uint32_t>(Coord.z) * ChildCurrLev * ChildCurrLev
-					+ Coord.y * ChildCurrLev + Coord.x;
-			}
-
 			__host__ __device__ VDBNode& Node(int32_t Level, uint32_t Index) const
 			{
 				return NodePerLevels[Level][Index];
 			}
-			__host__ __device__ VDBNode& Node(int32_t Level, const CoordType& Coord) const
-			{
-				return Node(Level, Index(Level, Coord));
-			}
+
 			__host__ __device__ uint32_t& Child(
 				int32_t ParentLevel, uint32_t ChildIndexInParent, const VDBNode& Parent) const
 			{
@@ -79,24 +66,13 @@ namespace DepthBoxVDB
 					ParentLevel, ChildIndexInParent(ParentLevel, ChildCoordInParent), Parent);
 			}
 
-			__host__ __device__ CoordType CoordInParentLevel(
-				int32_t ParentLevel, const CoordType& Coord) const
+			__host__ __device__ CoordType MapCoord(
+				int32_t DstLevel, int32_t SrcLevel, const CoordType& SrcCoord)
 			{
-				return Coord * VDBParams.ChildCoverVoxelPerLevels[ParentLevel - 1]
-					/ VDBParams.ChildCoverVoxelPerLevels[ParentLevel]
-					* VDBParams.ChildCoverVoxelPerLevels[ParentLevel - 1];
+				return SrcCoord * VDBParams.ChildCoverVoxelPerLevels[SrcLevel + 1]
+					/ VDBParams.ChildCoverVoxelPerLevels[DstLevel + 1];
 			}
-			__host__ __device__ CoordType ChildCoordInParent(
-				int32_t ParentLevel, const CoordType& Coord) const
-			{
-				CoordType VoxelPositionMin =
-					Coord * VDBParams.ChildCoverVoxelPerLevels[ParentLevel - 1];
-				CoordType VoxelPositionMinParent = VoxelPositionMin
-					/ VDBParams.ChildCoverVoxelPerLevels[ParentLevel]
-					* VDBParams.ChildCoverVoxelPerLevels[ParentLevel - 1];
-				return (VoxelPositionMin - VoxelPositionMinParent)
-					/ VDBParams.ChildCoverVoxelPerLevels[ParentLevel - 1];
-			}
+
 			__host__ __device__ uint32_t ChildIndexInParent(
 				int32_t ParentLevel, const CoordType& ChildCoordInParent) const
 			{
@@ -107,24 +83,30 @@ namespace DepthBoxVDB
 			}
 		};
 
-		class VDBBuilder;
-
-		class VDBProvider : public IVDBDataProvider
+		class VDBBuilder : public IVDBBuilder
 		{
 		public:
-			VDBProvider(const CreateParameters& Params);
-			~VDBProvider();
+			VDBBuilder(const CreateParameters& Params);
+			~VDBBuilder();
 
-		private:
-			void relayoutRAWVolume(const CreateParameters& Params);
-			void resizeAtlas();
+			void FullBuild(const FullBuildParameters& Params) override;
+			void UpdateDepthBoxAsync(const UpdateDepthBoxParameters& Params) override;
+			template <typename VoxelType>
+			void updateDepthBoxAsync(const UpdateDepthBoxParameters& Params);
+
+			VDBData* GetDeviceData() const;
+
+			// Declare Private functions in Public scope to use CUDA Lambda
+			void relayoutRAWVolume(const FullBuildParameters& Params);
+			bool resizeAtlas();
 			void updateAtlas();
 
 		private:
 			uint32_t	 ValidBrickNum = 0;
 			uint32_t	 MaxAllowedGPUMemoryInGB;
 			CoordType	 BrickPerAtlas;
-			cudaStream_t Stream = 0;
+			cudaStream_t AtlasStream = 0;
+			cudaStream_t NodeStream = 0;
 
 			VDBParameters VDBParams;
 
@@ -139,25 +121,7 @@ namespace DepthBoxVDB
 			thrust::device_vector<CoordType> dAtlasBrickToBrick;
 			thrust::device_vector<CoordType> dBrickToAtlasBrick;
 
-			friend class VDBBuilder;
-			friend class VolRenderer::VDBRenderer;
-		};
-
-		class VDBBuilder : public IVDBBuilder
-		{
-		public:
-			VDBBuilder(const CreateParameters& Params);
-			~VDBBuilder();
-
-			void FullBuild(const FullBuildParameters& Params) override;
-
-			VDBData* GetDeviceData() const;
-
-		private:
-			cudaStream_t Stream = 0;
-			VDBData*	 dData = nullptr;
-
-			std::shared_ptr<VDBProvider> Provider;
+			VDBData* dData = nullptr;
 
 			std::array<thrust::device_vector<VDBNode>, VDBParameters::MaxLevelNum>	dNodePerLevels;
 			std::array<thrust::device_vector<uint32_t>, VDBParameters::MaxLevelNum> dChildPerLevels;

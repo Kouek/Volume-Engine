@@ -62,10 +62,10 @@ namespace DepthBoxVDB
 			return Ret;
 		}
 
-		__host__ __device__ void Prepare(const glm::vec3& MinPosition, float ChildCoverVoxel)
+		__host__ __device__ void Prepare(const glm::vec3& MinVoxelPosition, float ChildCoverVoxel)
 		{
 			tDlt = glm::abs(ChildCoverVoxel / Direction);
-			glm::vec3 pFlt = (Origin + tCurr * Direction - MinPosition) / ChildCoverVoxel;
+			glm::vec3 pFlt = (Origin + tCurr * Direction - MinVoxelPosition) / ChildCoverVoxel;
 			tSide = ((glm::floor(pFlt) - pFlt + .5f) * glm::vec3{ Sign } + .5f) * tDlt + tCurr;
 			ChildCoord = glm::floor(pFlt);
 		}
@@ -99,9 +99,8 @@ namespace DepthBoxVDB
 		glm::vec3			 tSide;
 		glm::vec3			 tDelta;
 
-		__host__ __device__ bool Init(float t, float MaxPosValInBrick,
-			int32_t MinDepCoordValInBrick, int32_t MaxDepCoordValInBrick,
-			const glm::vec3& PosInBrick, const Ray& InRay)
+		__host__ __device__ bool Init(float t, float VoxelPerBrick, int32_t MinDepCoordValInBrick,
+			int32_t MaxDepCoordValInBrick, const glm::vec3& PosInBrick, const Ray& InRay)
 		{
 			Depth = 0.f;
 			Sign.x = InRay.Direction.x > 0.f ? 1 : InRay.Direction.x < 0.f ? -1 : 0;
@@ -111,15 +110,15 @@ namespace DepthBoxVDB
 
 			glm::ivec3 DepthSign;
 			{
-				glm::vec3 DistOnAxis{ Sign.x == 0 ? INFINITY
-						: Sign.x > 0			  ? PosInBrick.x
-												  : MaxPosValInBrick - PosInBrick.x,
+				glm::vec3 DistOnAxis(Sign.x == 0 ? INFINITY
+						: Sign.x > 0			 ? PosInBrick.x
+												 : VoxelPerBrick - PosInBrick.x,
 					Sign.y == 0		 ? INFINITY
 						: Sign.y > 0 ? PosInBrick.y
-									 : MaxPosValInBrick - PosInBrick.y,
+									 : VoxelPerBrick - PosInBrick.y,
 					Sign.z == 0		 ? INFINITY
 						: Sign.z > 0 ? PosInBrick.z
-									 : MaxPosValInBrick - PosInBrick.z };
+									 : VoxelPerBrick - PosInBrick.z);
 				DepthSign.x =
 					DistOnAxis.x < DistOnAxis.y && DistOnAxis.x <= DistOnAxis.z ? Sign.x : 0;
 				DepthSign.y =
@@ -137,8 +136,15 @@ namespace DepthBoxVDB
 
 			tDelta = glm::abs(1.f / InRay.Direction);
 			CoordInBrick = glm::floor(PosInBrick);
-			tSide = ((glm::floor(PosInBrick) - PosInBrick + .5f) * glm::vec3{ Sign } + .5f) * tDelta
-				+ t;
+#ifdef __CUDA_ARCH__
+	#pragma unroll
+#endif
+			for (uint8_t Axis = 0; Axis < 3; ++Axis)
+				if (CoordInBrick[Axis] < 0 || CoordInBrick[Axis] >= VoxelPerBrick)
+					return false;
+
+			tSide =
+				((glm::floor(PosInBrick) - PosInBrick + .5f) * glm::vec3(Sign) + .5f) * tDelta + t;
 
 			if (DepthSign.x != 0)
 			{
@@ -162,7 +168,9 @@ namespace DepthBoxVDB
 				tFromStart2Depth = glm::abs(InRay.Direction.z);
 			}
 
-			return (DepthSign.x | DepthSign.y | DepthSign.z);
+			DepthSign = glm::abs(DepthSign);
+			DepthSign.x = DepthSign.x + DepthSign.y + DepthSign.z;
+			return DepthSign.x == 1;
 		}
 
 		__host__ __device__ void StepNext()

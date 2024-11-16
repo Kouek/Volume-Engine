@@ -137,11 +137,19 @@ __device__ static DepthBoxVDB::Ray GenRay(const glm::uvec3& DispatchThreadID,
 	return EyeRay;
 }
 
+struct CUDA_ALIGN OnChildPushedParameters
+{
+	float								 tEnter;
+	float								 tExit;
+	int32_t								 Level;
+	const DepthBoxVDB::VolData::VDBNode& Node;
+};
+
 struct CUDA_ALIGN LeafEnteredParameters
 {
-	float						  tEnter;
-	float						  tExit;
-	DepthBoxVDB::VolData::VDBNode Node;
+	float								 tEnter;
+	float								 tExit;
+	const DepthBoxVDB::VolData::VDBNode& Node;
 };
 
 template <typename OnChildPushedType, typename OnSteppedType, typename LeafEnteredType>
@@ -170,9 +178,17 @@ __device__ static glm::vec4 RayCastVDB(const DepthBoxVDB::VolData::VDBData& VDBD
 
 	VDBStack Stack = VDBStack::Create(VDBData);
 	Stack.Push(0, HitShell.tExit - VolRenderer::Eps);
-
 	HDDA3D Hdda3d = HDDA3D ::Create(HitShell.tEnter + VolRenderer::Eps, EyeRay);
 	Hdda3d.Prepare(glm::vec3(0.f), VDBParams.ChildCoverVoxelPerLevels[VDBParams.RootLevel]);
+
+	if constexpr (!std::is_same_v<OnChildPushedType, nullptr_t>)
+	{
+		OnChildPushedParameters Params{ .tEnter = Hdda3d.tCurr,
+			.tExit = Hdda3d.tNext - VolRenderer::Eps,
+			.Level = Stack.Level,
+			.Node = Stack.TopNode() };
+		Callbacks.OnChildPushed(Params);
+	}
 
 	while (!Stack.Empty() && [&]() {
 #ifdef __CUDA_ARCH__
@@ -187,10 +203,10 @@ __device__ static glm::vec4 RayCastVDB(const DepthBoxVDB::VolData::VDBData& VDBD
 	{
 		Hdda3d.Next();
 
-		auto& Curr = Stack.TopNode();
-		auto  ChildIndexInCurr = VDBData.Child(Stack.Level, Hdda3d.ChildCoord, Curr);
+		auto& Parent = Stack.TopNode();
+		auto  ChildIndex = VDBData.Child(Stack.Level, Hdda3d.ChildCoord, Parent);
 
-		if (ChildIndexInCurr != VolData::VDBData::InvalidChild)
+		if (ChildIndex != VolData::VDBData::InvalidChild)
 		{
 			if (Stack.Level == 1)
 			{
@@ -198,26 +214,34 @@ __device__ static glm::vec4 RayCastVDB(const DepthBoxVDB::VolData::VDBData& VDBD
 
 				if constexpr (!std::is_same_v<LeafEnteredType, nullptr_t>)
 				{
-					LeafEnteredParameters LeafEntered;
-					LeafEntered.tEnter = Hdda3d.tCurr;
-					LeafEntered.tExit = Hdda3d.tNext - VolRenderer::Eps;
-					LeafEntered.Node = VDBData.Node(0, ChildIndexInCurr);
-					if (Callbacks.LeafEntered(LeafEntered))
+					LeafEnteredParameters Params{ .tEnter = Hdda3d.tCurr,
+						.tExit = Hdda3d.tNext - VolRenderer::Eps,
+						.Node = VDBData.Node(0, ChildIndex) };
+					if (Callbacks.LeafEntered(Params))
 						break;
 				}
 
 				Hdda3d.Step();
+				if constexpr (!std::is_same_v<OnSteppedType, nullptr_t>)
+				{
+					Callbacks.OnStepped();
+				}
 			}
 			else
 			{
-				Stack.Push(ChildIndexInCurr, Hdda3d.tNext - VolRenderer::Eps);
+				Stack.Push(ChildIndex, Hdda3d.tNext - VolRenderer::Eps);
 				Hdda3d.tCurr += VolRenderer::Eps;
 				Hdda3d.Prepare(
-					Stack.TopNode().Coord, VDBParams.ChildCoverVoxelPerLevels[Stack.Level]);
+					Stack.TopNode().Coord * VDBParams.ChildCoverVoxelPerLevels[Stack.Level + 1],
+					VDBParams.ChildCoverVoxelPerLevels[Stack.Level]);
 
 				if constexpr (!std::is_same_v<OnChildPushedType, nullptr_t>)
 				{
-					Callbacks.OnChildPushed();
+					OnChildPushedParameters Params{ .tEnter = Hdda3d.tCurr,
+						.tExit = Hdda3d.tNext - VolRenderer::Eps,
+						.Level = Stack.Level,
+						.Node = Stack.TopNode() };
+					Callbacks.OnChildPushed(Params);
 				}
 			}
 		}
@@ -237,12 +261,15 @@ __device__ static glm::vec4 RayCastVDB(const DepthBoxVDB::VolData::VDBData& VDBD
 			if (Stack.Empty())
 				break;
 
-			Hdda3d.Prepare(Stack.TopNode().Coord, VDBParams.ChildCoverVoxelPerLevels[Stack.Level]);
+			Hdda3d.Prepare(Stack.Level == VDBParams.RootLevel
+					? VolData::CoordType(0)
+					: Stack.TopNode().Coord * VDBParams.ChildCoverVoxelPerLevels[Stack.Level + 1],
+				VDBParams.ChildCoverVoxelPerLevels[Stack.Level]);
 		}
 	}
 }
 
-template <typename T>
+template <typename VoxelType>
 __device__ bool DepthSkip(const glm::vec3& PosInBrick,
 	const DepthBoxVDB::VolData::CoordType& MinCoordInAtlasBrick, LeafEnteredParameters& Params,
 	const DepthBoxVDB::VolData::VDBData& VDBData, const DepthBoxVDB::Ray& EyeRay)
@@ -259,11 +286,11 @@ __device__ bool DepthSkip(const glm::vec3& PosInBrick,
 
 	while (true)
 	{
-		T Depth = surf3Dread<T>(VDBData.AtlasSurface,
-			sizeof(T) * (MinCoordInAtlasBrick.x + DepDda2d.CoordInBrick.x),
-			MinCoordInAtlasBrick.y + DepDda2d.CoordInBrick.x,
+		VoxelType Depth = surf3Dread<VoxelType>(VDBData.AtlasSurface,
+			sizeof(VoxelType) * (MinCoordInAtlasBrick.x + DepDda2d.CoordInBrick.x),
+			MinCoordInAtlasBrick.y + DepDda2d.CoordInBrick.y,
 			MinCoordInAtlasBrick.z + DepDda2d.CoordInBrick.z);
-		if (Depth <= DepDda2d.Depth)
+		if (Depth <= DepDda2d.Depth + VolRenderer::Eps)
 			break;
 		if (DepDda2d.tCurr >= Params.tExit)
 			return true;
@@ -305,7 +332,7 @@ __device__ static glm::vec4 RenderScene(cudaTextureObject_t TransferFunctionText
 			if constexpr (bUseDepthBox)
 			{
 				if (DepthSkip<VoxelType>(PosInBrick, MinCoordInAtlasBrick, Params, VDBData, EyeRay))
-					return true;
+					return false;
 
 				Params.tEnter =
 					RendererParams.Step * glm::ceil(Params.tEnter / RendererParams.Step);
@@ -366,6 +393,51 @@ __device__ static glm::vec4 RenderScene(cudaTextureObject_t TransferFunctionText
 }
 
 __device__ static glm::vec4 RenderAABB(
+	int32_t Level, const DepthBoxVDB::VolData::VDBData& VDBData, const DepthBoxVDB::Ray& EyeRay)
+{
+	using namespace DepthBoxVDB;
+
+	const VolData::VDBParameters& VDBParams = VDBData.VDBParams;
+
+	glm::vec3 Color(0.f);
+	float	  Alpha = 0.f;
+
+	RayCastVDBCallbacks Callbacks = {
+		/* OnChildPushed */ [&](const OnChildPushedParameters& Params) {
+			if (Level != Params.Level)
+				return;
+
+			int32_t	  VoxelPerNode = Level == VDBParams.RootLevel
+				  ? VDBParams.ChildCoverVoxelPerLevels[Level] * VDBParams.ChildPerLevels[Level]
+				  : VDBParams.ChildCoverVoxelPerLevels[Level + 1];
+			glm::vec3 PosInBrick = EyeRay.Origin + Params.tEnter * EyeRay.Direction
+				- glm::vec3(Params.Node.Coord * VoxelPerNode);
+
+			Color = Color + (1.f - Alpha) * .5f * PosInBrick / float(VoxelPerNode);
+			Alpha = Alpha + (1.f - Alpha) * .5f;
+		},
+		/* OnStepped */ nullptr,
+		/* LeafEntered */
+		[&](const LeafEnteredParameters& Params) {
+			if (Level != 0)
+				return false;
+
+			glm::vec3 PosInBrick = EyeRay.Origin + Params.tEnter * EyeRay.Direction
+				- glm::vec3(Params.Node.Coord * VDBParams.ChildPerLevels[0]);
+
+			Color = Color + (1.f - Alpha) * .5f * PosInBrick / float(VDBParams.ChildPerLevels[0]);
+			Alpha = Alpha + (1.f - Alpha) * .5f;
+
+			return false;
+		}
+	};
+	RayCastVDB(VDBData, EyeRay, Callbacks);
+
+	return glm::vec4(Color, Alpha);
+}
+
+template <typename VoxelType>
+__device__ static glm::vec4 RenderDepthBox(
 	const DepthBoxVDB::VolData::VDBData& VDBData, const DepthBoxVDB::Ray& EyeRay)
 {
 	using namespace DepthBoxVDB;
@@ -379,11 +451,36 @@ __device__ static glm::vec4 RenderAABB(
 		/* OnStepped */ nullptr,
 		/* LeafEntered */
 		[&](const LeafEnteredParameters& Params) {
-			glm::vec3 PosInBrick = EyeRay.Origin + Params.tEnter * EyeRay.Direction
-				- glm::vec3(Params.Node.Coord * VDBParams.ChildPerLevels[0]);
+			glm::vec3 MinPosInBrick = glm::vec3(Params.Node.Coord * VDBParams.ChildPerLevels[0]);
+			glm::vec3	PosInBrick = EyeRay.Origin + Params.tEnter * EyeRay.Direction - MinPosInBrick;
+			VolData::CoordType MinCoordInAtlasBrick =
+				Params.Node.CoordInAtlas * VDBParams.VoxelPerAtlasBrick
+				+ VDBParams.ApronAndDepthWidth;
 
-			Color = PosInBrick / float(VDBParams.ChildPerLevels[0]);
 			Alpha = 1.f;
+			DepthDDA2D	DepDda2d;
+			if (DepDda2d.Init(Params.tEnter, VDBParams.ChildPerLevels[0],
+					VDBParams.DepthCoordValueInAtlasBrick[0],
+					VDBParams.DepthCoordValueInAtlasBrick[1], PosInBrick, EyeRay))
+			{
+				float Depth = surf3Dread<VoxelType>(VDBData.AtlasSurface,
+					sizeof(VoxelType) * (MinCoordInAtlasBrick.x + DepDda2d.CoordInBrick.x),
+					MinCoordInAtlasBrick.y + DepDda2d.CoordInBrick.y,
+					MinCoordInAtlasBrick.z + DepDda2d.CoordInBrick.z);
+				Color = glm::vec3(Depth / float(VDBParams.ChildPerLevels[0]));
+
+				// Debug FaceIndex
+				// if (Depth == 0 || Depth == 1)
+				//	Color.r = Color.g = 1.f;
+				// else if (Depth == 2 || Depth == 3)
+				//	Color.g = 1.f;
+				// else if (Depth == 4 || Depth == 5)
+				//	Color.b = 1.f;
+			}
+			else
+			{
+				Color.r = 1.f;
+			}
 
 			return true; // Break at the first leaf entered
 		} };
@@ -421,16 +518,15 @@ void DepthBoxVDB::VolRenderer::VDBRenderer::Render(const RenderParameters& Param
 		return;
 	}
 
-	const VolData::VDBBuilder&	Builder = static_cast<const VolData::VDBBuilder&>(Params.Builder);
-	const VolData::VDBProvider* Provider = Builder.Provider.get();
-	const VolData::VDBData*		dVDBData = Builder.GetDeviceData();
-	if (!Provider || !dVDBData)
+	const VolData::VDBBuilder& Builder = static_cast<const VolData::VDBBuilder&>(Params.Builder);
+	const VolData::VDBData*	   dVDBData = Builder.GetDeviceData();
+	if (!dVDBData)
 	{
-		std::cerr << "Empty Provider or Device Data\n";
+		std::cerr << "Empty Device Data\n";
 		return;
 	}
 
-	const VolData::VDBParameters& VDBParams = Provider->VDBParams;
+	const VolData::VDBParameters& VDBParams = Builder.VDBParams;
 
 	switch (VDBParams.VoxelType)
 	{
@@ -489,7 +585,14 @@ void DepthBoxVDB::VolRenderer::VDBRenderer::render(
 					TransferFunctionTexture, *RendererParams, *VDBData, EyeRay);
 				break;
 			case ERenderTarget::AABB0:
-				Color = RenderAABB(*VDBData, EyeRay);
+			case ERenderTarget::AABB1:
+			case ERenderTarget::AABB2:
+				Color = RenderAABB(static_cast<int32_t>(RendererParams->RenderTarget)
+						- static_cast<int32_t>(ERenderTarget::AABB0),
+					*VDBData, EyeRay);
+				break;
+			case ERenderTarget::DepthBox:
+				Color = RenderDepthBox<VoxelType>(*VDBData, EyeRay);
 				break;
 		}
 

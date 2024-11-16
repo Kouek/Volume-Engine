@@ -16,7 +16,7 @@ public:
 	UPROPERTY(EditAnywhere)
 	FVolRendererVDBRendererParameters VDBRendererParams;
 	UPROPERTY(EditAnywhere)
-	UVolDataVDBComponent* VDBComponent;
+	TObjectPtr<UVolDataVDBComponent> VDBComponent;
 
 	AVolRendererVDBActor(const FObjectInitializer&);
 	~AVolRendererVDBActor();
