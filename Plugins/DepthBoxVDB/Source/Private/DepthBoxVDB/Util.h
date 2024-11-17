@@ -11,6 +11,7 @@ namespace DepthBoxVDB
 	{
 		glm::vec3 Origin;
 		glm::vec3 Direction;
+		float	  SceneDepthToPixel;
 
 		struct HitShellResult
 		{

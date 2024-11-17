@@ -213,7 +213,7 @@ void DepthBoxVDB::VolData::VDBBuilder::FullBuild(const FullBuildParameters& Para
 				uint64_t ChildCurrLev = VDBParams.ChildPerLevels[Lev];
 				dChildPerLevels[Lev - 1].assign(
 					dNodePerLevels[Lev].size() * ChildCurrLev * ChildCurrLev * ChildCurrLev,
-					VDBData::InvalidChild);
+					VDBData::kInvalidChild);
 			}
 		}
 	}
@@ -566,7 +566,7 @@ void DepthBoxVDB::VolData::VDBBuilder::relayoutRAWVolume(const FullBuildParamete
 	VoxelNumPerBrick = VoxelNumPerBrick * VoxelNumPerBrick * VoxelNumPerBrick;
 
 	std::vector<std::future<void>> Futures(BrickNum);
-	BrickToAtlasBrick.assign(BrickNum, CoordType(InvalidCoordValue));
+	BrickToAtlasBrick.assign(BrickNum, CoordType(kInvalidCoordValue));
 	dBrickToAtlasBrick.resize(BrickNum);
 	BrickedData.resize(SizeOfVoxelType(VDBParams.VoxelType) * BrickNum * VoxelNumPerAtlasBrick);
 
@@ -666,7 +666,7 @@ void DepthBoxVDB::VolData::VDBBuilder::relayoutRAWVolume(const FullBuildParamete
 	uint32_t AtlasBrickIndex = 0;
 	for (uint32_t BrickIndex = 0; BrickIndex < BrickNum; ++BrickIndex)
 	{
-		if (BrickToAtlasBrick[BrickIndex] == CoordType(InvalidCoordValue))
+		if (BrickToAtlasBrick[BrickIndex] == CoordType(kInvalidCoordValue))
 			continue;
 
 		CoordType AtlasBrickCoord;
@@ -691,13 +691,13 @@ void DepthBoxVDB::VolData::VDBBuilder::relayoutRAWVolume(const FullBuildParamete
 
 	uint32_t AtlasBrickNum =
 		static_cast<uint32_t>(BrickPerAtlas.z) * BrickPerAtlas.y * BrickPerAtlas.x;
-	AtlasBrickToBrick.assign(AtlasBrickNum, CoordType(InvalidCoordValue));
+	AtlasBrickToBrick.assign(AtlasBrickNum, CoordType(kInvalidCoordValue));
 	dAtlasBrickToBrick.resize(AtlasBrickNum);
 
 	AtlasBrickIndex = 0;
 	for (uint32_t BrickIndex = 0; BrickIndex < BrickNum; ++BrickIndex)
 	{
-		if (BrickToAtlasBrick[BrickIndex] == CoordType(InvalidCoordValue))
+		if (BrickToAtlasBrick[BrickIndex] == CoordType(kInvalidCoordValue))
 			continue;
 
 		CoordType BrickCoord;
@@ -716,7 +716,7 @@ void DepthBoxVDB::VolData::VDBBuilder::relayoutRAWVolume(const FullBuildParamete
 		std::string DebugMsg = "CUDA Debug Brick <-> AtlasBrick:\n\t";
 		for (uint32_t BrickIndex = 0; BrickIndex < BrickNum; ++BrickIndex)
 		{
-			if (BrickToAtlasBrick[BrickIndex] == CoordType(InvalidCoordValue))
+			if (BrickToAtlasBrick[BrickIndex] == CoordType(kInvalidCoordValue))
 				continue;
 
 			DebugMsg += std::format(
@@ -726,7 +726,7 @@ void DepthBoxVDB::VolData::VDBBuilder::relayoutRAWVolume(const FullBuildParamete
 
 		for (uint32_t AtlasBrickIndex = 0; AtlasBrickIndex < AtlasBrickNum; ++AtlasBrickIndex)
 		{
-			if (AtlasBrickToBrick[AtlasBrickIndex] == CoordType(InvalidCoordValue))
+			if (AtlasBrickToBrick[AtlasBrickIndex] == CoordType(kInvalidCoordValue))
 				continue;
 
 			DebugMsg += std::format("a2b:{}->{}, ", AtlasBrickIndex,
@@ -842,7 +842,7 @@ void DepthBoxVDB::VolData::VDBBuilder::updateAtlas()
 	for (uint32_t AtlasBrickIndex = 0; AtlasBrickIndex < AtlasBrickToBrick.size();
 		 ++AtlasBrickIndex)
 	{
-		if (AtlasBrickToBrick[AtlasBrickIndex] == CoordType(InvalidCoordValue))
+		if (AtlasBrickToBrick[AtlasBrickIndex] == CoordType(kInvalidCoordValue))
 			continue;
 
 		switch (VDBParams.VoxelType)

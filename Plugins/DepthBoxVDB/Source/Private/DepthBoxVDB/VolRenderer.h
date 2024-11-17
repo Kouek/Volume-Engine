@@ -42,7 +42,7 @@ namespace DepthBoxVDB
 			bool	   bUsePreIntegratedTF = false;
 			glm::uvec2 RenderResolution;
 
-			std::unique_ptr<D3D12::TextureMappedCUDASurface> InDepthTexture;
+			std::unique_ptr<D3D12::TextureMappedCUDASurface> InSceneDepthTexture;
 			std::unique_ptr<D3D12::TextureMappedCUDASurface> OutColorTexture;
 			std::unique_ptr<CUDA::Texture>					 TransferFunctionTexture;
 			std::unique_ptr<CUDA::Texture>					 TransferFunctionTexturePreIntegrated;

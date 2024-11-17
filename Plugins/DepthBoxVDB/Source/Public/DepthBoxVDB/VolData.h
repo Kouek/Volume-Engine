@@ -19,7 +19,7 @@ namespace DepthBoxVDB
 		using CoordValueType = int32_t;
 		using CoordType = glm::vec<3, CoordValueType>;
 
-		static constexpr CoordValueType InvalidCoordValue =
+		static constexpr CoordValueType kInvalidCoordValue =
 			std::numeric_limits<CoordValueType>::max();
 
 		enum class EVoxelType : uint8_t
@@ -61,16 +61,15 @@ namespace DepthBoxVDB
 
 		struct CUDA_ALIGN VDBParameters
 		{
-			static constexpr int32_t MaxLevelNum = 3;
-			static constexpr int32_t MaxLogChildPerLevel = 9;
+			static constexpr int32_t kMaxLevelNum = 3;
 
 			EVoxelType VoxelType;
 			int32_t	   RootLevel;
 			int32_t	   ApronWidth;
 			int32_t	   ApronAndDepthWidth;
-			int32_t	   LogChildPerLevels[MaxLevelNum];
-			int32_t	   ChildPerLevels[MaxLevelNum];
-			int32_t	   ChildCoverVoxelPerLevels[MaxLevelNum];
+			int32_t	   LogChildPerLevels[kMaxLevelNum];
+			int32_t	   ChildPerLevels[kMaxLevelNum];
+			int32_t	   ChildCoverVoxelPerLevels[kMaxLevelNum];
 			int32_t	   DepthCoordValueInAtlasBrick[2];
 			int32_t	   VoxelPerAtlasBrick;
 			CoordType  VoxelPerVolume;

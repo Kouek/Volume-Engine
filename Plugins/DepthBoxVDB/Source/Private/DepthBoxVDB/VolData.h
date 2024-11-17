@@ -31,7 +31,7 @@ namespace DepthBoxVDB
 
 			__host__ __device__ static VDBNode CreateInvalid()
 			{
-				VDBNode Ret{ CoordType(InvalidCoordValue), CoordType(InvalidCoordValue),
+				VDBNode Ret{ CoordType(kInvalidCoordValue), CoordType(kInvalidCoordValue),
 					std::numeric_limits<uint64_t>::max() };
 				return Ret;
 			}
@@ -39,10 +39,10 @@ namespace DepthBoxVDB
 
 		struct CUDA_ALIGN VDBData
 		{
-			static constexpr uint32_t InvalidChild = std::numeric_limits<uint32_t>::max();
+			static constexpr uint32_t kInvalidChild = std::numeric_limits<uint32_t>::max();
 
-			VDBNode*  NodePerLevels[VDBParameters::MaxLevelNum] = { nullptr };
-			uint32_t* ChildPerLevels[VDBParameters::MaxLevelNum - 1] = { nullptr };
+			VDBNode*  NodePerLevels[VDBParameters::kMaxLevelNum] = { nullptr };
+			uint32_t* ChildPerLevels[VDBParameters::kMaxLevelNum - 1] = { nullptr };
 
 			cudaSurfaceObject_t AtlasSurface = 0;
 			cudaTextureObject_t AtlasTexture = 0;
@@ -123,8 +123,8 @@ namespace DepthBoxVDB
 
 			VDBData* dData = nullptr;
 
-			std::array<thrust::device_vector<VDBNode>, VDBParameters::MaxLevelNum>	dNodePerLevels;
-			std::array<thrust::device_vector<uint32_t>, VDBParameters::MaxLevelNum> dChildPerLevels;
+			std::array<thrust::device_vector<VDBNode>, VDBParameters::kMaxLevelNum>	dNodePerLevels;
+			std::array<thrust::device_vector<uint32_t>, VDBParameters::kMaxLevelNum> dChildPerLevels;
 
 			friend class VolRenderer::VDBRenderer;
 		};

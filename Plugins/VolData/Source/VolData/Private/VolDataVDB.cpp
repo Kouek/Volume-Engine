@@ -17,9 +17,9 @@ TOptional<FString> FVolDataVDBParameters::InitializeAndCheck(
 		return FString::Format(TEXT("Invalid " #Member " = {0}."), { Member }); \
 	}
 
-	for (int32 i = 0; i < MaxLevelNum; ++i)
+	for (int32 i = 0; i < kMaxLevelNum; ++i)
 	{
-		CHECK(LogChildPerLevels[i], 2, MaxLogChildPerLevel);
+		CHECK(LogChildPerLevels[i], 2, kMaxLogChildPerLevel);
 	}
 	CHECK(MaxAllowedGPUMemoryInGB, 1, 64);
 
@@ -27,10 +27,10 @@ TOptional<FString> FVolDataVDBParameters::InitializeAndCheck(
 
 	LogChildAtLevelZeroCached = LogChildPerLevels[0];
 
-	for (int Lev = 0; Lev < MaxLevelNum; ++Lev)
+	for (int Lev = 0; Lev < kMaxLevelNum; ++Lev)
 	{
 		int32 LogChildPerLevel = LogChildPerLevels[Lev];
-		if (LogChildPerLevel < 0 || LogChildPerLevel > MaxLogChildPerLevel)
+		if (LogChildPerLevel < 0 || LogChildPerLevel > kMaxLogChildPerLevel)
 			return FString::Format(TEXT("Invalid LogChildPerLevels[{0}] = {1}."), { Lev, LogChildPerLevel });
 
 		ChildPerLevels[Lev] = 1 << LogChildPerLevel;
@@ -50,7 +50,7 @@ TOptional<FString> FVolDataVDBParameters::InitializeAndCheck(
 			break;
 
 		++RootLevel;
-		if (RootLevel == MaxLevelNum)
+		if (RootLevel == kMaxLevelNum)
 		{
 			return FString::Format(TEXT("VDB cannot cover volume with size {0}."), { VoxelPerVolume.ToString() });
 		}
@@ -92,7 +92,7 @@ FVolDataVDBParameters::operator DepthBoxVDB::VolData::VDBParameters()
 	ASSIGN(RootLevel);
 	ASSIGN(ApronWidth);
 	ASSIGN(ApronAndDepthWidth);
-	for (int32 i = 0; i < MaxLevelNum; ++i)
+	for (int32 i = 0; i < kMaxLevelNum; ++i)
 	{
 		ASSIGN(LogChildPerLevels[i]);
 		ASSIGN(ChildPerLevels[i]);

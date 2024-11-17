@@ -7,18 +7,15 @@
 
 #include "Runtime/Renderer/Private/SceneRendering.h"
 
-TOptional<FString> FVolRendererVDBRendererParameters::InitializeAndCheck(float AspectRatioWOnH)
+TOptional<FString> FVolRendererVDBRendererParameters::InitializeAndCheck()
 {
-	AspectRatioWOnHCached = AspectRatioWOnH;
-
 #define CHECK(Member, Min, Max)                                                 \
 	if (Member < Min || Member > Max)                                           \
 	{                                                                           \
 		return FString::Format(TEXT("Invalid " #Member " = {0}."), { Member }); \
 	}
 
-	CHECK(RenderResolutionY, 100, 10000)
-	RenderResolutionX = FMath::RoundToInt(AspectRatioWOnHCached * RenderResolutionY);
+	CHECK(RenderResolutionLOD, 0, kMaxResolutionLOD)
 	CHECK(MaxStepNum, 1, 10000)
 	CHECK(Step, 0.f, std::numeric_limits<float>::max())
 	CHECK(MaxStepDist, 0.f, std::numeric_limits<float>::max())
@@ -38,6 +35,7 @@ FVolRendererVDBRendererParameters::operator DepthBoxVDB::VolRenderer::VDBRendere
 	Ret.RenderTarget = (DepthBoxVDB::VolRenderer::ERenderTarget)(uint8)RenderTarget;
 	ASSIGN(bUseDepthBox);
 	ASSIGN(bUsePreIntegratedTF);
+	ASSIGN(bUseDepthOcclusion);
 	ASSIGN(MaxStepNum);
 	ASSIGN(Step);
 	ASSIGN(MaxStepDist);
@@ -51,15 +49,18 @@ FVolRendererVDBRendererParameters::operator DepthBoxVDB::VolRenderer::VDBRendere
 class VOLRENDERER_API FDepthDownsamplingCS : public FGlobalShader
 {
 public:
-	static constexpr int32 ThreadPerGroup[2] = { 16, 16 };
+	static constexpr int32 kThreadPerGroup[2] = { 16, 16 };
 
 	DECLARE_GLOBAL_SHADER(FDepthDownsamplingCS);
 	SHADER_USE_PARAMETER_STRUCT(FDepthDownsamplingCS, FGlobalShader);
 
+	class FDimLOD : SHADER_PERMUTATION_RANGE_INT("DIM_LOD", 0, FVolRendererVDBRendererParameters::kMaxResolutionLOD);
+	using FPermutationDomain = TShaderPermutationDomain<FDimLOD>;
+
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, VOLRENDERER_API)
-	SHADER_PARAMETER(FIntPoint, InDepthSize)
-	SHADER_PARAMETER(FIntPoint, OutDepthSize)
+	SHADER_PARAMETER(FIntPoint, DepthTextureSize)
 	SHADER_PARAMETER(FVector4f, InvDeviceZToWorldZTransform)
+	SHADER_PARAMETER_SAMPLER(SamplerState, DepthSamplerState)
 	SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D, InDepthTexture)
 	SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D, OutDepthTexture)
 	END_SHADER_PARAMETER_STRUCT()
@@ -70,8 +71,8 @@ public:
 	{
 		FGlobalShader::ModifyCompilationEnvironment(Params, OutEnvironment);
 
-		OutEnvironment.SetDefine(TEXT("THREAD_PER_GROUP_X"), ThreadPerGroup[0]);
-		OutEnvironment.SetDefine(TEXT("THREAD_PER_GROUP_Y"), ThreadPerGroup[1]);
+		OutEnvironment.SetDefine(TEXT("THREAD_PER_GROUP_X"), kThreadPerGroup[0]);
+		OutEnvironment.SetDefine(TEXT("THREAD_PER_GROUP_Y"), kThreadPerGroup[1]);
 		OutEnvironment.SetDefine(TEXT("THREAD_PER_GROUP_Z"), 1);
 	}
 };
@@ -86,7 +87,7 @@ END_SHADER_PARAMETER_STRUCT()
 class VOLRENDERER_API FCompositionCS : public FGlobalShader
 {
 public:
-	static constexpr int32 ThreadPerGroup[2] = { 16, 16 };
+	static constexpr int32 kThreadPerGroup[2] = { 16, 16 };
 
 	DECLARE_GLOBAL_SHADER(FCompositionCS);
 	SHADER_USE_PARAMETER_STRUCT(FCompositionCS, FGlobalShader);
@@ -104,8 +105,8 @@ public:
 	{
 		FGlobalShader::ModifyCompilationEnvironment(Params, OutEnvironment);
 
-		OutEnvironment.SetDefine(TEXT("THREAD_PER_GROUP_X"), ThreadPerGroup[0]);
-		OutEnvironment.SetDefine(TEXT("THREAD_PER_GROUP_Y"), ThreadPerGroup[1]);
+		OutEnvironment.SetDefine(TEXT("THREAD_PER_GROUP_X"), kThreadPerGroup[0]);
+		OutEnvironment.SetDefine(TEXT("THREAD_PER_GROUP_Y"), kThreadPerGroup[1]);
 		OutEnvironment.SetDefine(TEXT("THREAD_PER_GROUP_Z"), 1);
 	}
 };
@@ -190,14 +191,44 @@ void FVolRendererVDBRenderer::Render_RenderThread(FPostOpaqueRenderParameters& P
 	auto* GraphBuilder = Params.GraphBuilder;
 	auto& RHICmdList = GraphBuilder->RHICmdList;
 
-	FIntPoint VolumeRenderResolution =
-		FIntPoint(VDBRendererParams.RenderResolutionX, VDBRendererParams.RenderResolutionY);
+	FIntPoint VolumeRenderResolution = Params.DepthTexture->Desc.Extent;
+	if (VDBRendererParams.RenderResolutionLOD > 0)
+	{
+		VolumeRenderResolution =
+			FIntPoint::DivideAndRoundUp(VolumeRenderResolution, 1 << VDBRendererParams.RenderResolutionLOD);
+	}
+
+	if (VDBRendererParams.bUseDepthOcclusion && VDBRendererParams.RenderResolutionLOD > 0)
+	{
+		if (!Params.View->ClosestHZB)
+		{
+			if (bCanLogErrInRender_RenderThread)
+			{
+				UE_LOG(LogVolRenderer, Warning, TEXT("Enable ClosestHZB to render Volumetric Scene"));
+				bCanLogErrInRender_RenderThread = false;
+			}
+			return;
+		}
+
+		// Note: Mip[0] of HZB is already the Mip[1] of ZBuffer
+		if (Params.View->ClosestHZB->Desc.NumMips < VDBRendererParams.RenderResolutionLOD)
+		{
+			if (bCanLogErrInRender_RenderThread)
+			{
+				UE_LOG(LogVolRenderer, Warning, TEXT("Config ClosestHZB to contain Mip-Level %d."),
+					VDBRendererParams.RenderResolutionLOD);
+				bCanLogErrInRender_RenderThread = false;
+			}
+			return;
+		}
+	}
+
 	{
 		constexpr ETextureCreateFlags NeededTextureCreateFlags = ETextureCreateFlags::Shared | ETextureCreateFlags::UAV;
 
 		bool bNeedRegister = false;
-		if (!DepthTexture.IsValid() || DepthTexture->GetDesc().Extent.X != VDBRendererParams.RenderResolutionX
-			|| DepthTexture->GetDesc().Extent.Y != VDBRendererParams.RenderResolutionY)
+		if (VDBRendererParams.bUseDepthOcclusion && !DepthTexture.IsValid()
+			|| DepthTexture->GetDesc().Extent != VolumeRenderResolution)
 		{
 			VDBRenderer->Unregister();
 
@@ -207,9 +238,7 @@ void FVolRendererVDBRenderer::Render_RenderThread(FPostOpaqueRenderParameters& P
 			DepthTexture = RHICmdList.CreateTexture(Desc);
 			bNeedRegister = true;
 		}
-		if (!VolumeColorTexture.IsValid()
-			|| VolumeColorTexture->GetDesc().Extent.X != VDBRendererParams.RenderResolutionX
-			|| VolumeColorTexture->GetDesc().Extent.Y != VDBRendererParams.RenderResolutionY)
+		if (!VolumeColorTexture.IsValid() || VolumeColorTexture->GetDesc().Extent != VolumeRenderResolution)
 		{
 			VDBRenderer->Unregister();
 
@@ -220,35 +249,46 @@ void FVolRendererVDBRenderer::Render_RenderThread(FPostOpaqueRenderParameters& P
 			bNeedRegister = true;
 		}
 
-		void* InDepthTextureNative = DepthTexture->GetNativeResource();
+		void* InDepthTextureNative = VDBRendererParams.bUseDepthOcclusion ? DepthTexture->GetNativeResource() : nullptr;
 		void* OutVolumeColorTextureNative = VolumeColorTexture->GetNativeResource();
 		if (bNeedRegister)
 		{
 			VolRenderer::FStdOutputLinker Linker;
 			VDBRenderer->Register({ .Device = GDynamicRHI->RHIGetNativeDevice(),
-				.InDepthTexture = InDepthTextureNative,
+				.InSceneDepthTexture = InDepthTextureNative,
 				.OutColorTexture = OutVolumeColorTextureNative });
 		}
+
+		VDBRendererParams.RenderResolution = VolumeRenderResolution;
+		OnRenderSizeChanged.Broadcast(VolumeRenderResolution);
 	}
 
-	auto DepthTextureRDG = RegisterExternalTexture(*GraphBuilder, DepthTexture, UE_SOURCE_LOCATION);
+	FRDGTextureRef DepthTextureRDG = nullptr;
+	if (VDBRendererParams.bUseDepthOcclusion)
 	{
+		DepthTextureRDG = RegisterExternalTexture(*GraphBuilder, DepthTexture.GetReference(), UE_SOURCE_LOCATION);
+
 		auto DepthTextureRDGUAV = GraphBuilder->CreateUAV(FRDGTextureUAVDesc(DepthTextureRDG));
 		auto ShaderParams = GraphBuilder->AllocParameters<FDepthDownsamplingCS::FParameters>();
-		ShaderParams->InDepthSize = Params.ViewportRect.Size();
-		ShaderParams->OutDepthSize = VolumeRenderResolution;
+		ShaderParams->DepthTextureSize = VolumeRenderResolution;
 		ShaderParams->InvDeviceZToWorldZTransform = Params.View->InvDeviceZToWorldZTransform;
-		ShaderParams->InDepthTexture = GraphBuilder->CreateSRV(FRDGTextureSRVDesc::Create(Params.DepthTexture));
+		ShaderParams->InDepthTexture = GraphBuilder->CreateSRV(FRDGTextureSRVDesc::Create(
+			VDBRendererParams.RenderResolutionLOD == 0 ? Params.DepthTexture : Params.View->ClosestHZB));
 		ShaderParams->OutDepthTexture = DepthTextureRDGUAV;
+		ShaderParams->DepthSamplerState = TStaticSamplerState<SF_Point>::GetRHI();
 
-		TShaderMapRef<FDepthDownsamplingCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		FDepthDownsamplingCS::FPermutationDomain PermutationVector;
+		PermutationVector.Set<FDepthDownsamplingCS::FDimLOD>(VDBRendererParams.RenderResolutionLOD);
+
+		TShaderMapRef<FDepthDownsamplingCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel), PermutationVector);
 		FComputeShaderUtils::AddPass(*GraphBuilder, RDG_EVENT_NAME("Depth Down Sampling"),
 			ERDGPassFlags::AsyncCompute | ERDGPassFlags::NeverCull, Shader, ShaderParams,
-			FIntVector(FMath::DivideAndRoundUp(VolumeRenderResolution.X, FDepthDownsamplingCS::ThreadPerGroup[0]),
-				FMath::DivideAndRoundUp(VolumeRenderResolution.Y, FDepthDownsamplingCS::ThreadPerGroup[1]), 1));
+			FIntVector(FMath::DivideAndRoundUp(VolumeRenderResolution.X, FDepthDownsamplingCS::kThreadPerGroup[0]),
+				FMath::DivideAndRoundUp(VolumeRenderResolution.Y, FDepthDownsamplingCS::kThreadPerGroup[1]), 1));
 	}
 
-	auto VolumeColorTextureRDG = RegisterExternalTexture(*GraphBuilder, VolumeColorTexture, UE_SOURCE_LOCATION);
+	FRDGTextureRef VolumeColorTextureRDG =
+		RegisterExternalTexture(*GraphBuilder, VolumeColorTexture, UE_SOURCE_LOCATION);
 	{
 		auto VolumeColorTextureRDGUAV = GraphBuilder->CreateUAV(FRDGTextureUAVDesc(VolumeColorTextureRDG));
 		auto ShaderParams = GraphBuilder->AllocParameters<FBarrierShaderParameters>();
@@ -312,7 +352,10 @@ void FVolRendererVDBRenderer::Render_RenderThread(FPostOpaqueRenderParameters& P
 		FComputeShaderUtils::AddPass(*GraphBuilder, RDG_EVENT_NAME("Composition"),
 			ERDGPassFlags::AsyncCompute | ERDGPassFlags::NeverCull, Shader, ShaderParams,
 			FIntVector(
-				FMath::DivideAndRoundUp(ShaderParams->RenderResolution.X, FDepthDownsamplingCS::ThreadPerGroup[0]),
-				FMath::DivideAndRoundUp(ShaderParams->RenderResolution.Y, FDepthDownsamplingCS::ThreadPerGroup[1]), 1));
+				FMath::DivideAndRoundUp(ShaderParams->RenderResolution.X, FDepthDownsamplingCS::kThreadPerGroup[0]),
+				FMath::DivideAndRoundUp(ShaderParams->RenderResolution.Y, FDepthDownsamplingCS::kThreadPerGroup[1]),
+				1));
 	}
+
+	bCanLogErrInRender_RenderThread = true;
 }

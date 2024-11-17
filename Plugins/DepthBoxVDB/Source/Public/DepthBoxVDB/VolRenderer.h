@@ -25,6 +25,7 @@ namespace DepthBoxVDB
 			AABB1,
 			AABB2,
 			DepthBox,
+			PixelDepth,
 			MAX
 		};
 
@@ -34,6 +35,7 @@ namespace DepthBoxVDB
 			int32_t		  MaxStepNum;
 			bool		  bUseDepthBox;
 			bool		  bUsePreIntegratedTF;
+			bool		  bUseDepthOcclusion;
 			float		  Step;
 			float		  MaxStepDist;
 			float		  MaxAlpha;
@@ -52,7 +54,7 @@ namespace DepthBoxVDB
 			struct RegisterParameters
 			{
 				void* Device;
-				void* InDepthTexture;
+				void* InSceneDepthTexture;
 				void* OutColorTexture;
 			};
 			virtual void Register(const RegisterParameters& Params) = 0;

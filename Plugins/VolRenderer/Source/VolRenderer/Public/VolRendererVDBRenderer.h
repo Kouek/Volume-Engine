@@ -33,10 +33,11 @@ UENUM()
 enum class EVolRendererRenderTarget : uint8
 {
 	Scene = 0 UMETA(DisplayName = "Volume Scenen"),
-	AABB0	 UMETA(DisplayName = "AABB of Level 0"),
-	AABB1	 UMETA(DisplayName = "AABB of Level 1"),
-	AABB2	 UMETA(DisplayName = "AABB of Level 2"),
-	DepthBox UMETA(DisplayName = "Depth Box")
+	AABB0	   UMETA(DisplayName = "AABB of Level 0"),
+	AABB1	   UMETA(DisplayName = "AABB of Level 1"),
+	AABB2	   UMETA(DisplayName = "AABB of Level 2"),
+	DepthBox   UMETA(DisplayName = "Depth Box"),
+	PixelDepth UMETA(DisplayName = "Input Pixel Depth")
 };
 
 USTRUCT()
@@ -44,6 +45,10 @@ struct FVolRendererVDBRendererParameters
 {
 	GENERATED_BODY()
 
+	static constexpr int32 kMaxResolutionLOD = 4;
+
+	UPROPERTY(VisibleAnywhere)
+	FIntPoint RenderResolution = { 0, 0 };
 	UPROPERTY(EditAnywhere)
 	EVolRendererRenderTarget RenderTarget = EVolRendererRenderTarget::Scene;
 	UPROPERTY(EditAnywhere)
@@ -51,9 +56,9 @@ struct FVolRendererVDBRendererParameters
 	UPROPERTY(EditAnywhere)
 	bool bUsePreIntegratedTF = true;
 	UPROPERTY(EditAnywhere)
-	int32 RenderResolutionY = 640;
-	UPROPERTY(VisibleAnywhere)
-	int32 RenderResolutionX;
+	bool bUseDepthOcclusion = true;
+	UPROPERTY(EditAnywhere)
+	int32 RenderResolutionLOD = 1;
 	UPROPERTY(EditAnywhere)
 	int32 MaxStepNum = 3000;
 	UPROPERTY(EditAnywhere)
@@ -63,9 +68,7 @@ struct FVolRendererVDBRendererParameters
 	UPROPERTY(EditAnywhere)
 	float MaxAlpha = .95f;
 
-	float AspectRatioWOnHCached = 1.f;
-
-	TOptional<FString> InitializeAndCheck(float AspectRatioWOnH);
+	TOptional<FString> InitializeAndCheck();
 
 	operator DepthBoxVDB::VolRenderer::VDBRendererParameters();
 };
@@ -84,7 +87,13 @@ public:
 	void SetParameters(const FVolRendererVDBRendererParameters& Params);
 	void Render_RenderThread(FPostOpaqueRenderParameters& Params);
 
+	DECLARE_MULTICAST_DELEGATE_OneParam(FOnRenderSizeChanged, FIntPoint);
+
+	FOnRenderSizeChanged OnRenderSizeChanged;
+
 private:
+	bool bCanLogErrInRender_RenderThread = true; // Avoid too much Error Logs when rendering
+
 	FTextureRHIRef DepthTexture;
 	FTextureRHIRef VolumeColorTexture;
 

@@ -26,8 +26,8 @@ struct FVolDataVDBParameters
 {
 	GENERATED_BODY()
 
-	static constexpr int32 MaxLevelNum = 3;
-	static constexpr int32 MaxLogChildPerLevel = 9;
+	static constexpr int32 kMaxLevelNum = 3;
+	static constexpr int32 kMaxLogChildPerLevel = 9;
 
 	UPROPERTY(VisibleAnywhere)
 	EVolDataVoxelType VoxelType = EVolDataVoxelType::None;
@@ -38,12 +38,12 @@ struct FVolDataVDBParameters
 	UPROPERTY(VisibleAnywhere)
 	int32 ApronAndDepthWidth = 2;
 	UPROPERTY(EditAnywhere)
-	int32 LogChildPerLevels[MaxLevelNum] = { 5, 4, 3 };
+	int32 LogChildPerLevels[kMaxLevelNum] = { 5, 4, 3 };
 	int32 LogChildAtLevelZeroCached = 0;
 	UPROPERTY(VisibleAnywhere)
-	int32 ChildPerLevels[MaxLevelNum] = { 32, 16, 8 };
+	int32 ChildPerLevels[kMaxLevelNum] = { 32, 16, 8 };
 	UPROPERTY(VisibleAnywhere)
-	int32 ChildCoverVoxelPerLevels[MaxLevelNum] = { 1, 32, 32 * 16 };
+	int32 ChildCoverVoxelPerLevels[kMaxLevelNum] = { 1, 32, 32 * 16 };
 	UPROPERTY(VisibleAnywhere)
 	int32 DepthCoordValueInAtlasBrick[2] = { -1, 32 };
 	UPROPERTY(VisibleAnywhere)

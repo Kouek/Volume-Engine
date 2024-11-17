@@ -12,9 +12,9 @@ DepthBoxVDB::VolRenderer::IVDBRenderer::Create(const CreateParameters& Params)
 
 struct CUDA_ALIGN VDBStack
 {
-	DepthBoxVDB::VolData::VDBNode nodes[DepthBoxVDB::VolData::VDBParameters::MaxLevelNum - 1];
+	DepthBoxVDB::VolData::VDBNode nodes[DepthBoxVDB::VolData::VDBParameters::kMaxLevelNum - 1];
 	const DepthBoxVDB::VolData::VDBData& VDBData;
-	float	tExits[DepthBoxVDB::VolData::VDBParameters::MaxLevelNum - 1];
+	float	tExits[DepthBoxVDB::VolData::VDBParameters::kMaxLevelNum - 1];
 	int32_t Level;
 
 	__host__ __device__ static VDBStack Create(const DepthBoxVDB::VolData::VDBData& VDBData)
@@ -60,22 +60,28 @@ DepthBoxVDB::VolRenderer::VDBRenderer::~VDBRenderer()
 void DepthBoxVDB::VolRenderer::VDBRenderer::Register(const RegisterParameters& Params)
 {
 	ID3D12Device*	Device = reinterpret_cast<ID3D12Device*>(Params.Device);
-	ID3D12Resource* InDepthTextureNative = reinterpret_cast<ID3D12Resource*>(Params.InDepthTexture);
+	ID3D12Resource* InSceneDepthTextureNative =
+		reinterpret_cast<ID3D12Resource*>(Params.InSceneDepthTexture);
 	ID3D12Resource* OutColorTextureNative =
 		reinterpret_cast<ID3D12Resource*>(Params.OutColorTexture);
-	InDepthTexture = std::make_unique<D3D12::TextureMappedCUDASurface>(
-		D3D12NodeMask, Device, InDepthTextureNative);
+
+	if (Params.InSceneDepthTexture)
+		InSceneDepthTexture = std::make_unique<D3D12::TextureMappedCUDASurface>(
+			D3D12NodeMask, Device, InSceneDepthTextureNative);
+
 	OutColorTexture = std::make_unique<D3D12::TextureMappedCUDASurface>(
 		D3D12NodeMask, Device, OutColorTextureNative);
-	RenderResolution.x = InDepthTexture->TextureDesc.Width;
-	RenderResolution.y = InDepthTexture->TextureDesc.Height;
-	assert(RenderResolution.x == OutColorTexture->TextureDesc.Width
-		&& RenderResolution.y == OutColorTexture->TextureDesc.Height);
+	RenderResolution.x = OutColorTexture->TextureDesc.Width;
+	RenderResolution.y = OutColorTexture->TextureDesc.Height;
+
+	if (InSceneDepthTexture)
+		assert(RenderResolution.x == OutColorTexture->TextureDesc.Width
+			&& RenderResolution.y == OutColorTexture->TextureDesc.Height);
 }
 
 void DepthBoxVDB::VolRenderer::VDBRenderer::Unregister()
 {
-	InDepthTexture.reset();
+	InSceneDepthTexture.reset();
 	OutColorTexture.reset();
 }
 
@@ -130,7 +136,9 @@ __device__ static DepthBoxVDB::Ray GenRay(const glm::uvec3& DispatchThreadID,
 	Tmp = InverseProjection * Tmp;
 
 	EyeRay.Direction = Tmp;
-	EyeRay.Direction = CameraRotation * glm::normalize(EyeRay.Direction);
+	EyeRay.Direction = glm::normalize(EyeRay.Direction);
+	EyeRay.SceneDepthToPixel = glm::abs(1.f / EyeRay.Direction.z);
+	EyeRay.Direction = CameraRotation * EyeRay.Direction;
 
 	EyeRay.Origin = CameraPosition;
 
@@ -170,7 +178,6 @@ __device__ static glm::vec4 RayCastVDB(const DepthBoxVDB::VolData::VDBData& VDBD
 	const VolData::VDBParameters& VDBParams = VDBData.VDBParams;
 
 	Ray::HitShellResult HitShell = EyeRay.HitAABB(glm::vec3(0.f), VDBParams.VoxelPerVolume);
-
 	if (HitShell.tEnter >= HitShell.tExit)
 	{
 		return glm::vec4(0.f);
@@ -206,7 +213,7 @@ __device__ static glm::vec4 RayCastVDB(const DepthBoxVDB::VolData::VDBData& VDBD
 		auto& Parent = Stack.TopNode();
 		auto  ChildIndex = VDBData.Child(Stack.Level, Hdda3d.ChildCoord, Parent);
 
-		if (ChildIndex != VolData::VDBData::InvalidChild)
+		if (ChildIndex != VolData::VDBData::kInvalidChild)
 		{
 			if (Stack.Level == 1)
 			{
@@ -303,7 +310,7 @@ __device__ bool DepthSkip(const glm::vec3& PosInBrick,
 
 template <typename VoxelType, bool bUseDepthBox, bool bUsePreIntegratedTF>
 __device__ static glm::vec4 RenderScene(cudaTextureObject_t TransferFunctionTexture,
-	const DepthBoxVDB::VolRenderer::VDBRendererParameters&	RendererParams,
+	float InputPixelDepth, const DepthBoxVDB::VolRenderer::VDBRendererParameters& RendererParams,
 	const DepthBoxVDB::VolData::VDBData& VDBData, const DepthBoxVDB::Ray& EyeRay)
 {
 	using namespace DepthBoxVDB;
@@ -352,6 +359,9 @@ __device__ static glm::vec4 RenderScene(cudaTextureObject_t TransferFunctionText
 					   return true;
 				   }())
 			{
+				if (Params.tEnter >= InputPixelDepth)
+					return true;
+
 				glm::vec3 SamplePos = MinPosInAtlasBrick + PosInBrick;
 				float	  Scalar =
 					tex3D<float>(VDBData.AtlasTexture, SamplePos.x, SamplePos.y, SamplePos.z);
@@ -489,14 +499,33 @@ __device__ static glm::vec4 RenderDepthBox(
 	return glm::vec4(Color, Alpha);
 }
 
+__device__ static glm::vec4 RenderPixelDepth(float InputPixelDepth)
+{
+	using namespace DepthBoxVDB;
+
+	int32_t Division = glm::ceil(InputPixelDepth / 255.f);
+	Division = glm::min(Division, 3);
+
+	float	  Remained = InputPixelDepth;
+	glm::vec3 Color(0.f);
+	for (int32_t i = 0; i < Division; ++i)
+	{
+		Color[i] = glm::min(Remained, 255.f);
+		Remained -= Color[i];
+	}
+	Color /= 255.f;
+
+	return glm::vec4(Color, 1.f);
+}
+
 void DepthBoxVDB::VolRenderer::VDBRenderer::Render(const RenderParameters& Params)
 {
-	if (!InDepthTexture || !OutColorTexture)
+	if (!InSceneDepthTexture || !OutColorTexture)
 	{
 		std::cerr << "Empty Mapped CUDA Texture/Surface(s)\n";
 		return;
 	}
-	if (!InDepthTexture->IsComplete() || !OutColorTexture->IsComplete())
+	if (!InSceneDepthTexture->IsComplete() || !OutColorTexture->IsComplete())
 	{
 		std::cerr << "Incomplete Mapped CUDA Texture/Surface(s)\n";
 		return;
@@ -563,7 +592,9 @@ void DepthBoxVDB::VolRenderer::VDBRenderer::render(
 							CameraRotation = Params.CameraRotationToLocal,
 							CameraPosition = Params.CameraPositionToLocal,
 							RenderResolution = RenderResolution,
-							InDepthSurface = InDepthTexture->SurfaceObject,
+							InSceneDepthSurface = InSceneDepthTexture
+								? InSceneDepthTexture->SurfaceObject
+								: cudaSurfaceObject_t(0),
 							OutColorSurface = OutColorTexture->SurfaceObject,
 							TransferFunctionTexture = bUsePreIntegratedTF
 								? TransferFunctionTexturePreIntegrated->Get()
@@ -577,13 +608,25 @@ void DepthBoxVDB::VolRenderer::VDBRenderer::render(
 		Ray EyeRay = GenRay(
 			DispatchThreadID, RenderResolution, InverseProjection, CameraRotation, CameraPosition);
 
+		auto GetPixelDepth = [&]() {
+			if (InSceneDepthSurface == 0 || !RendererParams->bUseDepthOcclusion)
+				return 3.4028234e38f; // std::numeric_limits<float>::max()
+
+			return EyeRay.SceneDepthToPixel
+				* surf2Dread<float>(
+					InSceneDepthSurface, sizeof(float) * DispatchThreadID.x, DispatchThreadID.y);
+		};
+
 		glm::vec4 Color;
 		switch (RendererParams->RenderTarget)
 		{
 			case ERenderTarget::Scene:
+			{
+				float InputPixelDepth = GetPixelDepth();
 				Color = RenderScene<VoxelType, bUseDepthBox, bUsePreIntegratedTF>(
-					TransferFunctionTexture, *RendererParams, *VDBData, EyeRay);
-				break;
+					TransferFunctionTexture, InputPixelDepth, *RendererParams, *VDBData, EyeRay);
+			}
+			break;
 			case ERenderTarget::AABB0:
 			case ERenderTarget::AABB1:
 			case ERenderTarget::AABB2:
@@ -594,6 +637,22 @@ void DepthBoxVDB::VolRenderer::VDBRenderer::render(
 			case ERenderTarget::DepthBox:
 				Color = RenderDepthBox<VoxelType>(*VDBData, EyeRay);
 				break;
+			case ERenderTarget::PixelDepth:
+			{
+				float InputPixelDepth = GetPixelDepth();
+				// Debug tExit
+				// Ray::HitShellResult HitShell =
+				//	EyeRay.HitAABB(glm::vec3(0.f), VDBData->VDBParams.VoxelPerVolume);
+				// if (HitShell.tEnter >= HitShell.tExit)
+				//{
+				//	Color = glm::vec4(0.f);
+				//	break;
+				//}
+				// InputPixelDepth = HitShell.tExit;
+
+				Color = RenderPixelDepth(InputPixelDepth);
+			}
+			break;
 		}
 
 		Color = glm::clamp(Color * 255.f, 0.f, 255.f);

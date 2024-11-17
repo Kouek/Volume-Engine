@@ -3,12 +3,18 @@
 AVolRendererVDBActor::AVolRendererVDBActor(const FObjectInitializer&)
 {
 	VDBComponent = CreateDefaultSubobject<UVolDataVDBComponent>(TEXT("VDB"));
-
-	VDBRenderer = MakeShared<FVolRendererVDBRenderer>();
-
 	VDBComponent->OnTransferFunctionChanged.AddLambda([this](UVolDataVDBComponent* VDBComponent) {
 		auto CPUData = VDBComponent->GetCPUData();
 		VDBRenderer->SetTransferFunction(CPUData->TransferFunctionData, CPUData->TransferFunctionDataPreIntegrated);
+	});
+
+	VDBRenderer = MakeShared<FVolRendererVDBRenderer>();
+	VDBRenderer->OnRenderSizeChanged.AddLambda([this](FIntPoint ActualRenderResolution) {
+		VDBRendererParamsCS.Lock();
+
+		VDBRendererParams.RenderResolution = ActualRenderResolution;
+
+		VDBRendererParamsCS.Unlock();
 	});
 }
 
@@ -23,12 +29,7 @@ void AVolRendererVDBActor::PostLoad()
 
 	VDBRenderer->Register();
 
-	FViewport* Viewport = getViewport();
-	setupRenderer(Viewport);
-	if (Viewport)
-	{
-		Viewport->ViewportResizedEvent.AddUObject(this, &AVolRendererVDBActor::setupRenderer);
-	}
+	setupRenderer();
 }
 
 void AVolRendererVDBActor::Destroyed()
@@ -46,32 +47,17 @@ void AVolRendererVDBActor::PostEditChangeProperty(FPropertyChangedEvent& Propert
 	if (PropertyChangedEvent.GetMemberPropertyName()
 		== GET_MEMBER_NAME_CHECKED(AVolRendererVDBActor, VDBRendererParams))
 	{
-		setupRenderer(getViewport());
+		setupRenderer();
 	}
 }
 #endif
 
-FViewport* AVolRendererVDBActor::getViewport()
-{
-	if (auto* ViewportClient = GetWorld()->GetGameViewport(); ViewportClient)
-	{
-		return ViewportClient->Viewport;
-	}
-#if WITH_EDITOR
-	else if (auto* Viewport = GEditor->GetActiveViewport(); Viewport)
-	{
-		return Viewport;
-	}
-#endif
-
-	return nullptr;
-}
-
-void AVolRendererVDBActor::setupRenderer(FViewport* Viewport, uint32)
+void AVolRendererVDBActor::setupRenderer()
 {
 	{
-		auto ErrMsgOpt = Viewport ? VDBRendererParams.InitializeAndCheck(Viewport->GetDesiredAspectRatio())
-								  : VDBRendererParams.InitializeAndCheck(1.f);
+		VDBRendererParamsCS.Lock();
+		auto ErrMsgOpt = VDBRendererParams.InitializeAndCheck();
+		VDBRendererParamsCS.Unlock();
 		if (ErrMsgOpt.IsSet())
 		{
 			UE_LOG(LogVolRenderer, Error, TEXT("%s"), *ErrMsgOpt.GetValue());
@@ -95,11 +81,5 @@ void AVolRendererVDBActor::clearRenderer()
 
 void AVolRendererVDBActor::clearResource()
 {
-	if (ViewportResized.IsValid())
-	{
-		getViewport()->ViewportResizedEvent.Remove(ViewportResized);
-		ViewportResized.Reset();
-	}
-
 	clearRenderer();
 }

@@ -30,12 +30,12 @@ public:
 #endif
 
 private:
-	FViewport* getViewport();
-	void	   setupRenderer(FViewport* Viewport = nullptr, uint32 = 0);
-	void	   clearRenderer();
-	void	   clearResource();
+	void setupRenderer();
+	void clearRenderer();
+	void clearResource();
 
 private:
-	FDelegateHandle						ViewportResized;
 	TSharedPtr<FVolRendererVDBRenderer> VDBRenderer;
+
+	FCriticalSection VDBRendererParamsCS;
 };
