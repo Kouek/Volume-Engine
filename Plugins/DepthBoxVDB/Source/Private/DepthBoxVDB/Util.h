@@ -169,9 +169,7 @@ namespace DepthBoxVDB
 				tFromStart2Depth = glm::abs(InRay.Direction.z);
 			}
 
-			DepthSign = glm::abs(DepthSign);
-			DepthSign.x = DepthSign.x + DepthSign.y + DepthSign.z;
-			return DepthSign.x == 1;
+			return true;
 		}
 
 		__host__ __device__ void StepNext()

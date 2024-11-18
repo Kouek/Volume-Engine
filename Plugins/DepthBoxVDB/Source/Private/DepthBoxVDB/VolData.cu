@@ -345,9 +345,14 @@ void DepthBoxVDB::VolData::VDBBuilder::UpdateDepthBoxAsync(const UpdateDepthBoxP
 		case EVoxelType::UInt8:
 			updateDepthBoxAsync<uint8_t>(Params);
 			break;
+		case EVoxelType::UInt16:
+			updateDepthBoxAsync<uint16_t>(Params);
+			break;
 		case EVoxelType::Float32:
 			updateDepthBoxAsync<float>(Params);
 			break;
+		default:
+			assert(false);
 	}
 }
 
@@ -539,6 +544,8 @@ void DepthBoxVDB::VolData::VDBBuilder::updateDepthBoxAsync(const UpdateDepthBoxP
 }
 template void DepthBoxVDB::VolData::VDBBuilder::updateDepthBoxAsync<uint8_t>(
 	const UpdateDepthBoxParameters& Params);
+template void DepthBoxVDB::VolData::VDBBuilder::updateDepthBoxAsync<uint16_t>(
+	const UpdateDepthBoxParameters& Params);
 template void DepthBoxVDB::VolData::VDBBuilder::updateDepthBoxAsync<float>(
 	const UpdateDepthBoxParameters& Params);
 
@@ -648,11 +655,19 @@ void DepthBoxVDB::VolData::VDBBuilder::relayoutRAWVolume(const FullBuildParamete
 								reinterpret_cast<uint8_t*>(BrickedData.data()),
 								reinterpret_cast<const uint8_t*>(Params.RAWVolumeData), BrickCoord);
 							break;
+						case EVoxelType::UInt16:
+							Futures[BrickIndex] =
+								std::async(Assign, reinterpret_cast<uint16_t*>(BrickedData.data()),
+									reinterpret_cast<const uint16_t*>(Params.RAWVolumeData),
+									BrickCoord);
+							break;
 						case EVoxelType::Float32:
 							Futures[BrickIndex] = std::async(Assign,
 								reinterpret_cast<float*>(BrickedData.data()),
 								reinterpret_cast<const float*>(Params.RAWVolumeData), BrickCoord);
 							break;
+						default:
+							assert(false);
 					}
 
 					++BrickIndex;
@@ -791,11 +806,14 @@ bool DepthBoxVDB::VolData::VDBBuilder::resizeAtlas()
 			case EVoxelType::UInt8:
 				ChannelDesc = cudaCreateChannelDesc<uint8_t>();
 				break;
+			case EVoxelType::UInt16:
+				ChannelDesc = cudaCreateChannelDesc<uint16_t>();
+				break;
 			case EVoxelType::Float32:
 				ChannelDesc = cudaCreateChannelDesc<float>();
 				break;
 			default:
-				return false;
+				assert(false);
 		}
 		AtlasArray = std::make_shared<CUDA::Array>(ChannelDesc, NeededVoxelPerAtlas);
 	}
@@ -850,9 +868,14 @@ void DepthBoxVDB::VolData::VDBBuilder::updateAtlas()
 			case EVoxelType::UInt8:
 				Transfer(reinterpret_cast<uint8_t*>(BrickedData.data()), AtlasBrickIndex);
 				break;
+			case EVoxelType::UInt16:
+				Transfer(reinterpret_cast<uint16_t*>(BrickedData.data()), AtlasBrickIndex);
+				break;
 			case EVoxelType::Float32:
 				Transfer(reinterpret_cast<float*>(BrickedData.data()), AtlasBrickIndex);
 				break;
+			default:
+				assert(false);
 		}
 	}
 }

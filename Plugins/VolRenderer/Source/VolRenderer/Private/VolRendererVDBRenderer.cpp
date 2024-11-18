@@ -20,6 +20,13 @@ TOptional<FString> FVolRendererVDBRendererParameters::InitializeAndCheck()
 	CHECK(Step, 0.f, std::numeric_limits<float>::max())
 	CHECK(MaxStepDist, 0.f, std::numeric_limits<float>::max())
 	CHECK(MaxAlpha, .1f, 1.f);
+	for (int32 Axis = 0; Axis < 3; ++Axis)
+	{
+		if (FMath::IsNaN(InvVoxelSpaces[Axis]))
+		{
+			return FString("Invalid InvVoxelSpaces.");
+		}
+	}
 
 #undef CHECK
 
@@ -40,6 +47,11 @@ FVolRendererVDBRendererParameters::operator DepthBoxVDB::VolRenderer::VDBRendere
 	ASSIGN(Step);
 	ASSIGN(MaxStepDist);
 	ASSIGN(MaxAlpha);
+
+	for (int32 i = 0; i < 3; ++i)
+	{
+		ASSIGN(InvVoxelSpaces[i]);
+	}
 
 #undef ASSIGN
 
@@ -260,7 +272,7 @@ void FVolRendererVDBRenderer::Render_RenderThread(FPostOpaqueRenderParameters& P
 		}
 
 		VDBRendererParams.RenderResolution = VolumeRenderResolution;
-		OnRenderSizeChanged.Broadcast(VolumeRenderResolution);
+		OnRenderSizeChanged_RenderThread.Broadcast(VolumeRenderResolution);
 	}
 
 	FRDGTextureRef DepthTextureRDG = nullptr;
@@ -310,15 +322,22 @@ void FVolRendererVDBRenderer::Render_RenderThread(FPostOpaqueRenderParameters& P
 		glm::vec3 CameraPositionToLoacl;
 		{
 			const FVector& CameraPos = Params.View->ViewMatrices.GetViewOrigin();
-			AssignLeftHandedToRight(CameraPositionToLoacl, CameraPos);
+			AssignLeftHandedToRight(
+				CameraPositionToLoacl, VDBRendererParams.Transform.InverseTransformPositionNoScale(CameraPos));
 		}
 
 		glm::mat3 CameraRotationToLoacl;
 		{
-			AssignLeftHandedToRight(CameraRotationToLoacl[2], Params.View->GetViewDirection());
+			FMatrix RotationToLocal = VDBRendererParams.Transform.GetRotation().ToMatrix();
+			RotationToLocal = RotationToLocal.GetTransposed();
+
+			AssignLeftHandedToRight(
+				CameraRotationToLoacl[2], RotationToLocal.TransformVector(Params.View->GetViewDirection()));
 			CameraRotationToLoacl[2] *= -1.f;
-			AssignLeftHandedToRight(CameraRotationToLoacl[0], Params.View->GetViewRight());
-			AssignLeftHandedToRight(CameraRotationToLoacl[1], Params.View->GetViewUp());
+			AssignLeftHandedToRight(
+				CameraRotationToLoacl[0], RotationToLocal.TransformVector(Params.View->GetViewRight()));
+			AssignLeftHandedToRight(
+				CameraRotationToLoacl[1], RotationToLocal.TransformVector(Params.View->GetViewUp()));
 		}
 
 		const FMatrix& InvProjMatrix = Params.View->ViewMatrices.GetInvProjectionMatrix();
@@ -330,13 +349,16 @@ void FVolRendererVDBRenderer::Render_RenderThread(FPostOpaqueRenderParameters& P
 
 		GraphBuilder->AddPass(RDG_EVENT_NAME("Volume Rendering"), ShaderParametersMetadata, ShaderParams,
 			ERDGPassFlags::AsyncCompute | ERDGPassFlags::NeverCull,
-			[InverseProjection, CameraRotationToLoacl, CameraPositionToLoacl, DepthTexture = DepthTexture,
-				VolumeColorTexture = VolumeColorTexture, VDBRenderer = VDBRenderer.get(),
+			[InverseProjection, CameraRotationToLoacl,
+				CameraPositionToVDB = glm::vec3(VDBRendererParams.InvVoxelSpaces.X, VDBRendererParams.InvVoxelSpaces.Y,
+										  VDBRendererParams.InvVoxelSpaces.Z)
+					* CameraPositionToLoacl,
+				DepthTexture = DepthTexture, VolumeColorTexture = VolumeColorTexture, VDBRenderer = VDBRenderer.get(),
 				VDBBuilder = VDBBuilder.get()](FRHICommandListImmediate& RHICmdList) {
 				VolRenderer::FStdOutputLinker Linker;
 				VDBRenderer->Render({ .InverseProjection = InverseProjection,
 					.CameraRotationToLocal = CameraRotationToLoacl,
-					.CameraPositionToLocal = CameraPositionToLoacl,
+					.CameraPositionToVDB = CameraPositionToVDB,
 					.Builder = *VDBBuilder });
 			});
 	}

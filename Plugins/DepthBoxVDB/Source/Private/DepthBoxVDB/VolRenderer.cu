@@ -119,28 +119,34 @@ void DepthBoxVDB::VolRenderer::VDBRenderer::SetTransferFunction(
 
 __device__ static DepthBoxVDB::Ray GenRay(const glm::uvec3& DispatchThreadID,
 	const glm::uvec2& RenderResolution, const glm::mat4& InverseProjection,
-	const glm::mat3& CameraRotation, const glm::vec3& CameraPosition)
+	const glm::mat3& CameraRotationToLocal, const glm::vec3& CameraPositionVDBSpace,
+	const glm::vec3& InvVoxelSpaces)
 {
 	DepthBoxVDB::Ray EyeRay;
 
 	// Map [0, RenderResolution.xy - 1] to (-1, 1)
-	glm::vec4 Tmp;
-	Tmp.z = RenderResolution.x;
-	Tmp.w = RenderResolution.y;
-	Tmp.x = (2.f * DispatchThreadID.x + 1.f - Tmp.z) / Tmp.z;
-	Tmp.y = (2.f * (RenderResolution.y - 1 - DispatchThreadID.y) + 1.f - Tmp.w) / Tmp.w;
+	{
+		glm::vec4 Tmp;
+		Tmp.z = RenderResolution.x;
+		Tmp.w = RenderResolution.y;
+		Tmp.x = (2.f * DispatchThreadID.x + 1.f - Tmp.z) / Tmp.z;
+		Tmp.y = (2.f * (RenderResolution.y - 1 - DispatchThreadID.y) + 1.f - Tmp.w) / Tmp.w;
 
-	// Inverseproject
-	Tmp.z = 1.f;
-	Tmp.w = 1.f;
-	Tmp = InverseProjection * Tmp;
+		// Inverseproject
+		Tmp.z = 1.f;
+		Tmp.w = 1.f;
+		Tmp = InverseProjection * Tmp;
 
-	EyeRay.Direction = Tmp;
+		EyeRay.Direction = Tmp;
+	}
+
 	EyeRay.Direction = glm::normalize(EyeRay.Direction);
-	EyeRay.SceneDepthToPixel = glm::abs(1.f / EyeRay.Direction.z);
-	EyeRay.Direction = CameraRotation * EyeRay.Direction;
+	EyeRay.SceneDepthToPixel = glm::abs(EyeRay.Direction.z);
+	EyeRay.Direction = InvVoxelSpaces * (CameraRotationToLocal * EyeRay.Direction);
+	EyeRay.SceneDepthToPixel = glm::length(EyeRay.Direction) / EyeRay.SceneDepthToPixel;
+	EyeRay.Direction = glm::normalize(EyeRay.Direction);
 
-	EyeRay.Origin = CameraPosition;
+	EyeRay.Origin = CameraPositionVDBSpace;
 
 	return EyeRay;
 }
@@ -557,27 +563,27 @@ void DepthBoxVDB::VolRenderer::VDBRenderer::Render(const RenderParameters& Param
 
 	const VolData::VDBParameters& VDBParams = Builder.VDBParams;
 
+	auto DispatchRender = [&]<typename VoxelType>(VoxelType*) {
+		if (bUseDepthBox && bUsePreIntegratedTF)
+			render<VoxelType, true, true>(Params, dVDBData);
+		else if (!bUseDepthBox && bUsePreIntegratedTF)
+			render<VoxelType, false, true>(Params, dVDBData);
+		else if (bUseDepthBox && !bUsePreIntegratedTF)
+			render<VoxelType, true, false>(Params, dVDBData);
+		else
+			render<VoxelType, false, false>(Params, dVDBData);
+	};
+
 	switch (VDBParams.VoxelType)
 	{
 		case VolData::EVoxelType::UInt8:
-			if (bUseDepthBox && bUsePreIntegratedTF)
-				render<uint8_t, true, true>(Params, dVDBData);
-			else if (!bUseDepthBox && bUsePreIntegratedTF)
-				render<uint8_t, false, true>(Params, dVDBData);
-			else if (bUseDepthBox && !bUsePreIntegratedTF)
-				render<uint8_t, true, false>(Params, dVDBData);
-			else
-				render<uint8_t, false, false>(Params, dVDBData);
+			DispatchRender((uint8_t*)nullptr);
+			break;
+		case VolData::EVoxelType::UInt16:
+			DispatchRender((uint16_t*)nullptr);
 			break;
 		case VolData::EVoxelType::Float32:
-			if (bUseDepthBox && bUsePreIntegratedTF)
-				render<float, true, true>(Params, dVDBData);
-			else if (!bUseDepthBox && bUsePreIntegratedTF)
-				render<float, false, true>(Params, dVDBData);
-			else if (bUseDepthBox && !bUsePreIntegratedTF)
-				render<float, true, false>(Params, dVDBData);
-			else
-				render<float, false, false>(Params, dVDBData);
+			DispatchRender((float*)nullptr);
 			break;
 	}
 
@@ -589,8 +595,8 @@ void DepthBoxVDB::VolRenderer::VDBRenderer::render(
 	const RenderParameters& Params, const VolData::VDBData* dVDBData)
 {
 	auto RenderKernel = [InverseProjection = Params.InverseProjection,
-							CameraRotation = Params.CameraRotationToLocal,
-							CameraPosition = Params.CameraPositionToLocal,
+							CameraRotationToLocal = Params.CameraRotationToLocal,
+							CameraPositionToVDB = Params.CameraPositionToVDB,
 							RenderResolution = RenderResolution,
 							InSceneDepthSurface = InSceneDepthTexture
 								? InSceneDepthTexture->SurfaceObject
@@ -605,8 +611,8 @@ void DepthBoxVDB::VolRenderer::VDBRenderer::render(
 		if (DispatchThreadID.x >= RenderResolution.x || DispatchThreadID.y >= RenderResolution.y)
 			return;
 
-		Ray EyeRay = GenRay(
-			DispatchThreadID, RenderResolution, InverseProjection, CameraRotation, CameraPosition);
+		Ray EyeRay = GenRay(DispatchThreadID, RenderResolution, InverseProjection,
+			CameraRotationToLocal, CameraPositionToVDB, RendererParams->InvVoxelSpaces);
 
 		auto GetPixelDepth = [&]() {
 			if (InSceneDepthSurface == 0 || !RendererParams->bUseDepthOcclusion)
@@ -674,6 +680,14 @@ template void DepthBoxVDB::VolRenderer::VDBRenderer::render<uint8_t, false, true
 template void DepthBoxVDB::VolRenderer::VDBRenderer::render<uint8_t, true, false>(
 	const RenderParameters& Params, const VolData::VDBData* dVDBData);
 template void DepthBoxVDB::VolRenderer::VDBRenderer::render<uint8_t, false, false>(
+	const RenderParameters& Params, const VolData::VDBData* dVDBData);
+template void DepthBoxVDB::VolRenderer::VDBRenderer::render<uint16_t, true, true>(
+	const RenderParameters& Params, const VolData::VDBData* dVDBData);
+template void DepthBoxVDB::VolRenderer::VDBRenderer::render<uint16_t, false, true>(
+	const RenderParameters& Params, const VolData::VDBData* dVDBData);
+template void DepthBoxVDB::VolRenderer::VDBRenderer::render<uint16_t, true, false>(
+	const RenderParameters& Params, const VolData::VDBData* dVDBData);
+template void DepthBoxVDB::VolRenderer::VDBRenderer::render<uint16_t, false, false>(
 	const RenderParameters& Params, const VolData::VDBData* dVDBData);
 template void DepthBoxVDB::VolRenderer::VDBRenderer::render<float, true, true>(
 	const RenderParameters& Params, const VolData::VDBData* dVDBData);

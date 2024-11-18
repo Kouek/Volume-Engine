@@ -86,6 +86,8 @@ struct FVolDataLoadTransferFunctionParameters
 
 	bool bNeedReload = false;
 
+	UPROPERTY(EditAnywhere)
+	bool bNeedFullRebuild = true;
 	UPROPERTY(VisibleAnywhere)
 	uint32 Resolution = 256;
 	UPROPERTY(VisibleAnywhere)
@@ -93,7 +95,7 @@ struct FVolDataLoadTransferFunctionParameters
 };
 
 UCLASS()
-class VOLDATA_API UVolDataVDBComponent : public UActorComponent
+class VOLDATA_API UVolDataVDBComponent : public USceneComponent
 {
 	GENERATED_BODY()
 
@@ -131,7 +133,7 @@ public:
 #endif
 
 private:
-	void setupTransferFunction(bool bNeedReload = false);
+	void setupTransferFunction();
 	void buildVDB(bool bNeedReload = false, bool bNeedRelayoutAtlas = false);
 
 private:

@@ -64,9 +64,13 @@ struct FVolRendererVDBRendererParameters
 	UPROPERTY(EditAnywhere)
 	float Step = .333f;
 	UPROPERTY(EditAnywhere)
-	float MaxStepDist = 1000.f;
+	float MaxStepDist = 3000.f;
 	UPROPERTY(EditAnywhere)
 	float MaxAlpha = .95f;
+	UPROPERTY(VisibleAnywhere)
+	FVector InvVoxelSpaces = { 1., 1., 1. };
+
+	FTransform Transform;
 
 	TOptional<FString> InitializeAndCheck();
 
@@ -89,7 +93,7 @@ public:
 
 	DECLARE_MULTICAST_DELEGATE_OneParam(FOnRenderSizeChanged, FIntPoint);
 
-	FOnRenderSizeChanged OnRenderSizeChanged;
+	FOnRenderSizeChanged OnRenderSizeChanged_RenderThread;
 
 private:
 	bool bCanLogErrInRender_RenderThread = true; // Avoid too much Error Logs when rendering

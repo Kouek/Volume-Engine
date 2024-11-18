@@ -145,7 +145,6 @@ void UVolDataVDBComponent::LoadTransferFunction()
 	LoadTransferFunctionParameters.SourcePath.FilePath = Files[0];
 	LoadTransferFunctionParameters.bNeedReload = true;
 
-	setupTransferFunction();
 	buildVDB();
 }
 
@@ -153,13 +152,14 @@ void UVolDataVDBComponent::PostLoad()
 {
 	Super::PostLoad();
 
-	setupTransferFunction(true);
 	buildVDB(true);
 }
 
 #if WITH_EDITOR
 void UVolDataVDBComponent::PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent)
 {
+	Super::PostEditChangeProperty(PropertyChangedEvent);
+
 	if (PropertyChangedEvent.GetMemberPropertyName() == GET_MEMBER_NAME_CHECKED(UVolDataVDBComponent, VDBParams))
 	{
 		if (PropertyChangedEvent.GetPropertyName() == GET_MEMBER_NAME_CHECKED(FVolDataVDBParameters, LogChildPerLevels))
@@ -174,11 +174,8 @@ void UVolDataVDBComponent::PostEditChangeProperty(FPropertyChangedEvent& Propert
 }
 #endif
 
-void UVolDataVDBComponent::setupTransferFunction(bool bNeedReload)
+void UVolDataVDBComponent::setupTransferFunction()
 {
-	if (!bNeedReload && !LoadTransferFunctionParameters.bNeedReload)
-		return;
-
 	CPUData->EmptyScalarRanges.Empty();
 
 	auto DataOrErrMsg = FVolDataTransferFunction::LoadFromFile(
@@ -248,7 +245,6 @@ void UVolDataVDBComponent::setupTransferFunction(bool bNeedReload)
 	CPUData->TransferFunctionDataPreIntegrated = FVolDataTransferFunction::PreIntegrateFromFlatArray<false>(
 		CPUData->TransferFunctionData, LoadTransferFunctionParameters.Resolution);
 
-	LoadTransferFunctionParameters.bNeedReload = false;
 	OnTransferFunctionChanged.Broadcast(this);
 }
 
@@ -278,6 +274,14 @@ void UVolDataVDBComponent::buildVDB(bool bNeedReload, bool bNeedRelayoutAtlas)
 
 		LoadRAWVolumeParams.bNeedReload = false;
 		bNeedFullRebuild = true;
+	}
+
+	if (bNeedReload || LoadTransferFunctionParameters.bNeedReload)
+	{
+		setupTransferFunction();
+
+		LoadTransferFunctionParameters.bNeedReload = false;
+		bNeedFullRebuild |= LoadTransferFunctionParameters.bNeedFullRebuild;
 	}
 
 	if (!CPUData->IsComplete())

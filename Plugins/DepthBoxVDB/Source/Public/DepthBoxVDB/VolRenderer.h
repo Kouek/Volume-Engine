@@ -39,6 +39,7 @@ namespace DepthBoxVDB
 			float		  Step;
 			float		  MaxStepDist;
 			float		  MaxAlpha;
+			glm::vec3	  InvVoxelSpaces;
 		};
 
 		class IVDBRenderer : Noncopyable
@@ -74,7 +75,7 @@ namespace DepthBoxVDB
 			{
 				glm::mat4					InverseProjection;
 				glm::mat3					CameraRotationToLocal;
-				glm::vec3					CameraPositionToLocal;
+				glm::vec3					CameraPositionToVDB;
 				const VolData::IVDBBuilder& Builder;
 			};
 			virtual void Render(const RenderParameters& Params) = 0;

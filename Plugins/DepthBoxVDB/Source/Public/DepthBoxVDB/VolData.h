@@ -26,6 +26,7 @@ namespace DepthBoxVDB
 		{
 			None = 0,
 			UInt8,
+			UInt16,
 			Float32,
 			MAX
 		};
@@ -36,27 +37,29 @@ namespace DepthBoxVDB
 			{
 				case EVoxelType::UInt8:
 					return sizeof(uint8_t);
+				case EVoxelType::UInt16:
+					return sizeof(uint16_t);
 				case EVoxelType::Float32:
 					return sizeof(float);
 				default:
+					assert(false);
 					return 0;
 			}
 		}
 
 		inline cudaChannelFormatDesc CUDAChannelDescOfVoxelType(EVoxelType VoxelType)
 		{
-			cudaChannelFormatDesc ChannelDesc{};
 			switch (VoxelType)
 			{
 				case EVoxelType::UInt8:
-					ChannelDesc = cudaCreateChannelDesc<uint8_t>();
-					break;
+					return cudaCreateChannelDesc<uint8_t>();
 				case EVoxelType::Float32:
-					ChannelDesc = cudaCreateChannelDesc<float>();
+					return cudaCreateChannelDesc<float>();
 					break;
+				default:
+					assert(false);
+					return {};
 			}
-
-			return ChannelDesc;
 		}
 
 		struct CUDA_ALIGN VDBParameters

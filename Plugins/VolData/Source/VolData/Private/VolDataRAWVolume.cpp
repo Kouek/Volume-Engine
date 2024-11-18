@@ -60,6 +60,8 @@ TVariant<FVolDataRAWVolumeData::LoadFromFileParameters::RetValueType, FString> F
 	{
 		case EVolDataVoxelType::UInt8:
 			return Load((uint8*)nullptr);
+		case EVolDataVoxelType::UInt16:
+			return Load((uint16*)nullptr);
 		case EVolDataVoxelType::Float32:
 			return Load((float*)nullptr);
 		default:
@@ -94,6 +96,8 @@ TVariant<FVolDataRAWVolumeData::CreateTextureParameters::RetValueType, FString> 
 	{
 		case EVolDataVoxelType::UInt8:
 			return Create((uint8*)nullptr);
+		case EVolDataVoxelType::UInt16:
+			return Create((uint16*)nullptr);
 		case EVolDataVoxelType::Float32:
 			return Create((float*)nullptr);
 		default:

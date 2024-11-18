@@ -38,6 +38,7 @@ namespace DepthBoxVDB
 			cudaStream_t		   Stream = 0;
 			VDBRendererParameters* dParams = nullptr;
 
+			/* Keep only necessary states in CPU */
 			bool	   bUseDepthBox = false;
 			bool	   bUsePreIntegratedTF = false;
 			glm::uvec2 RenderResolution;

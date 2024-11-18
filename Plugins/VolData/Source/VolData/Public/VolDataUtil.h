@@ -12,6 +12,7 @@ enum class EVolDataVoxelType : uint8
 {
 	None = 0 UMETA(DisplayName = "None"),
 	UInt8	UMETA(DisplayName = "Unsigned Int 8 bit"),
+	UInt16	UMETA(DisplayName = "Unsigned Int 16 bit"),
 	Float32 UMETA(DisplayName = "Float 32 bit")
 };
 
@@ -22,10 +23,13 @@ namespace VolData
 		switch (VoxelType)
 		{
 			case EVolDataVoxelType::UInt8:
-				return EPixelFormat::PF_R8;
+				return EPixelFormat::PF_R8_UINT;
+			case EVolDataVoxelType::UInt16:
+				return EPixelFormat::PF_R16_UINT;
 			case EVolDataVoxelType::Float32:
 				return EPixelFormat::PF_R32_FLOAT;
 			default:
+				check(false);
 				return EPixelFormat::PF_Unknown;
 		}
 	}
@@ -36,9 +40,12 @@ namespace VolData
 		{
 			case EVolDataVoxelType::UInt8:
 				return sizeof(uint8);
+			case EVolDataVoxelType::UInt16:
+				return sizeof(uint16);
 			case EVolDataVoxelType::Float32:
 				return sizeof(float);
 			default:
+				check(false);
 				return 0;
 		}
 	}
