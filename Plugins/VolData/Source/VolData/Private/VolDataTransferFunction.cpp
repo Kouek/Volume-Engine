@@ -2,18 +2,17 @@
 
 #include <array>
 
-template <bool bUseHalf>
-TVariant<typename FVolDataTransferFunction::LoadFromFileParameters<bUseHalf>::RetValueType, FString>
-FVolDataTransferFunction::LoadFromFile(const LoadFromFileParameters<bUseHalf>& Params)
+TVariant<typename FVolDataTransferFunction::LoadFromFileParameters::RetValueType, FString>
+FVolDataTransferFunction::LoadFromFile(const LoadFromFileParameters& Params)
 {
-	using RetType = TVariant<typename LoadFromFileParameters<bUseHalf>::RetValueType, FString>;
+	using RetType = TVariant<typename LoadFromFileParameters::RetValueType, FString>;
 
 	FJsonSerializableArray Buffer;
 	if (!FFileHelper::LoadANSITextFileToStrings(*Params.SourcePath.FilePath, nullptr, Buffer))
 		return RetType(
 			TInPlaceType<FString>(), FString::Format(TEXT("Invalid SourcePath {0}."), { Params.SourcePath.FilePath }));
 
-	TMap<float, FVector4f> Points;
+	typename LoadFromFileParameters::RetValueType Points;
 	for (int Line = 0; Line < Buffer.Num(); ++Line)
 	{
 		if (Buffer[Line].IsEmpty())
@@ -22,72 +21,24 @@ FVolDataTransferFunction::LoadFromFile(const LoadFromFileParameters<bUseHalf>& P
 		float LineVars[5] = { 0.f };
 		int	  ValidCount = sscanf(StringCast<ANSICHAR>(*Buffer[Line]).Get(), "%f%f%f%f%f", &LineVars[0], &LineVars[1],
 			  &LineVars[2], &LineVars[3], &LineVars[4]);
-		if (ValidCount != 5 || [&]() {
-				for (int i = 0; i < 5; ++i)
-					if (LineVars[i] < 0.f || LineVars[i] >= 255.5f)
-						return true;
-				return false;
-			}())
+		if (ValidCount != 5)
 			return RetType(TInPlaceType<FString>(),
 				FString::Format(
 					TEXT("Invalid contents at line {0} in SourcePath {1}."), { Line + 1, Params.SourcePath.FilePath }));
 
-		auto& RGBA = Points.Emplace(std::clamp(std::roundf(LineVars[0]), 0.f, static_cast<float>(Params.Resolution)));
+		auto& RGBA = Points.Emplace(LineVars[0]);
 		for (int CmpIdx = 0; CmpIdx < 4; ++CmpIdx)
 			RGBA[CmpIdx] = std::min(std::max(LineVars[CmpIdx + 1] / 255.f, 0.f), 1.f);
 	}
 
-	return RetType(TInPlaceType<typename LoadFromFileParameters<bUseHalf>::RetValueType>(),
-		LerpFromPointsToFlatArray<bUseHalf>(Points, Params.Resolution));
+	return RetType(TInPlaceType<typename LoadFromFileParameters::RetValueType>(), Points);
 }
-template TVariant<typename FVolDataTransferFunction::LoadFromFileParameters<false>::RetValueType, FString>
-FVolDataTransferFunction::LoadFromFile<false>(const LoadFromFileParameters<false>& Params);
-template TVariant<typename FVolDataTransferFunction::LoadFromFileParameters<true>::RetValueType, FString>
-FVolDataTransferFunction::LoadFromFile<true>(const LoadFromFileParameters<true>& Params);
 
 template <bool bUseHalf>
-FVolDataTransferFunction::LoadFromFileParameters<bUseHalf>::RetValueType
-FVolDataTransferFunction::LerpFromPointsToFlatArray(const TMap<float, FVector4f>& Points, uint32 Resolution)
+FVolDataTransferFunction::FlattenDataTrait<bUseHalf>::Type FVolDataTransferFunction::PreIntegrateFromFlatArray(
+	const typename FlattenDataTrait<bUseHalf>::Type& Array, uint32 Resolution)
 {
-	typename LoadFromFileParameters<bUseHalf>::RetValueType Data;
-
-	Data.Reserve(Resolution * 4);
-
-	auto Itr = Points.begin();
-	auto ItrPrev = Itr;
-	++Itr;
-	for (uint32 Scalar = 0; Scalar < Resolution; ++Scalar)
-	{
-		if (Scalar > Itr->Key)
-		{
-			++ItrPrev;
-			++Itr;
-		}
-		auto& [ScalarCurr, ColorCurr] = *Itr;
-		auto& [ScalarPrev, ColorPrev] = *ItrPrev;
-
-		auto K = ScalarCurr == ScalarPrev ? 1.f : (Scalar - ScalarPrev) / (ScalarCurr - ScalarPrev);
-		auto RGBA = (1.f - K) * ColorPrev + K * ColorCurr;
-
-		Data.Emplace(RGBA.X);
-		Data.Emplace(RGBA.Y);
-		Data.Emplace(RGBA.Z);
-		Data.Emplace(RGBA.W);
-	}
-
-	return Data;
-}
-template FVolDataTransferFunction::LoadFromFileParameters<false>::RetValueType
-FVolDataTransferFunction::LerpFromPointsToFlatArray<false>(const TMap<float, FVector4f>& Points, uint32 Resolution);
-template FVolDataTransferFunction::LoadFromFileParameters<true>::RetValueType
-FVolDataTransferFunction::LerpFromPointsToFlatArray<true>(const TMap<float, FVector4f>& Points, uint32 Resolution);
-
-template <bool bUseHalf>
-FVolDataTransferFunction::LoadFromFileParameters<bUseHalf>::RetValueType
-FVolDataTransferFunction::PreIntegrateFromFlatArray(
-	const typename LoadFromFileParameters<bUseHalf>::RetValueType& Array, uint32 Resolution)
-{
-	using ElementType = typename FVolDataTransferFunction::LoadFromFileParameters<bUseHalf>::RetValueType::ElementType;
+	using ElementType = typename FlattenDataTrait<bUseHalf>::Type::ElementType;
 
 	TArray<std::array<float, 4>>	  DatPreMultAlphaAvg;
 	const std::array<ElementType, 4>* Dat = reinterpret_cast<const std::array<ElementType, 4>*>(Array.GetData());
@@ -111,7 +62,7 @@ FVolDataTransferFunction::PreIntegrateFromFlatArray(
 		}
 	}
 
-	typename FVolDataTransferFunction::LoadFromFileParameters<bUseHalf>::RetValueType DatPreInt;
+	typename FlattenDataTrait<bUseHalf>::Type DatPreInt;
 	DatPreInt.SetNum(4 * Resolution * Resolution);
 
 	std::array<ElementType, 4>* DatPtrPreInt = reinterpret_cast<std::array<ElementType, 4>*>(DatPreInt.GetData());
@@ -146,12 +97,12 @@ FVolDataTransferFunction::PreIntegrateFromFlatArray(
 
 	return DatPreInt;
 }
-template FVolDataTransferFunction::LoadFromFileParameters<false>::RetValueType
+template FVolDataTransferFunction::FlattenDataTrait<false>::Type
 FVolDataTransferFunction::PreIntegrateFromFlatArray<false>(
-	typename const LoadFromFileParameters<false>::RetValueType& Array, uint32 Resolution);
-template FVolDataTransferFunction::LoadFromFileParameters<true>::RetValueType
+	typename const FlattenDataTrait<false>::Type& Array, uint32 Resolution);
+template FVolDataTransferFunction::FlattenDataTrait<true>::Type
 FVolDataTransferFunction::PreIntegrateFromFlatArray<true>(
-	typename const LoadFromFileParameters<true>::RetValueType& Array, uint32 Resolution);
+	typename const FlattenDataTrait<true>::Type& Array, uint32 Resolution);
 
 TVariant<FVolDataTransferFunction::CreateTextureParameters::RetValueType, FString>
 FVolDataTransferFunction::CreateTexture(const CreateTextureParameters& Params)

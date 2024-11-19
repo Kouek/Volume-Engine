@@ -272,7 +272,7 @@ void FVolRendererVDBRenderer::Render_RenderThread(FPostOpaqueRenderParameters& P
 		}
 
 		VDBRendererParams.RenderResolution = VolumeRenderResolution;
-		OnRenderSizeChanged_RenderThread.Broadcast(VolumeRenderResolution);
+		RenderSizeChanged_RenderThread.Broadcast(VolumeRenderResolution);
 	}
 
 	FRDGTextureRef DepthTextureRDG = nullptr;

@@ -91,9 +91,9 @@ public:
 	void SetParameters(const FVolRendererVDBRendererParameters& Params);
 	void Render_RenderThread(FPostOpaqueRenderParameters& Params);
 
-	DECLARE_MULTICAST_DELEGATE_OneParam(FOnRenderSizeChanged, FIntPoint);
+	DECLARE_MULTICAST_DELEGATE_OneParam(FRenderSizeChanged, FIntPoint);
 
-	FOnRenderSizeChanged OnRenderSizeChanged_RenderThread;
+	FRenderSizeChanged RenderSizeChanged_RenderThread;
 
 private:
 	bool bCanLogErrInRender_RenderThread = true; // Avoid too much Error Logs when rendering

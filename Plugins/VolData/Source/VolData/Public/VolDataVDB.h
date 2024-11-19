@@ -2,6 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "Components/ActorComponent.h"
+#include "Curves/CurveLinearColor.h"
 
 #include "VolDataUtil.h"
 
@@ -18,7 +19,11 @@ struct FVolDataVDBCPUData
 	TArray<float>	  TransferFunctionDataPreIntegrated;
 	TArray<glm::vec2> EmptyScalarRanges;
 
-	bool IsComplete() const { return !RAWVolumeData.IsEmpty() && !EmptyScalarRanges.IsEmpty(); }
+	bool IsComplete() const
+	{
+		return !RAWVolumeData.IsEmpty() && !TransferFunctionData.IsEmpty()
+			&& !TransferFunctionDataPreIntegrated.IsEmpty();
+	}
 };
 
 USTRUCT()
@@ -90,6 +95,8 @@ struct FVolDataLoadTransferFunctionParameters
 	bool bNeedFullRebuild = true;
 	UPROPERTY(VisibleAnywhere)
 	uint32 Resolution = 256;
+	UPROPERTY(EditAnywhere)
+	float MaxScalarInTF = 0.f;
 	UPROPERTY(VisibleAnywhere)
 	FFilePath SourcePath;
 };
@@ -105,35 +112,42 @@ public:
 	UPROPERTY(EditAnywhere, Category = "VolData")
 	FVolDataVDBParameters VDBParams;
 	UPROPERTY(VisibleAnywhere, Transient, Category = "VolData")
-	UTexture2D* TransferFunction = nullptr;
+	TObjectPtr<UTexture2D> TransferFunction = nullptr;
 	UPROPERTY(VisibleAnywhere, Transient, Category = "VolData")
-	UTexture2D* TransferFunctionPreIntegrated = nullptr;
+	TObjectPtr<UTexture2D> TransferFunctionPreIntegrated = nullptr;
+	UPROPERTY(VisibleAnywhere, Transient, Category = "VIS4Earth")
+	TObjectPtr<UCurveLinearColor> TransferFunctionCurve = nullptr;
 
-	UPROPERTY(EditAnywhere, Category = "VolData")
+	UPROPERTY(EditAnywhere, Category = "VolData", DisplayName = "Load RAW Vol")
 	FVolDataLoadRAWVolumeParameters LoadRAWVolumeParams;
 	UFUNCTION(CallInEditor, Category = "VolData")
 	void LoadRAWVolume();
 
-	UPROPERTY(EditAnywhere, Category = "VolData")
+	UPROPERTY(EditAnywhere, Category = "VolData", DisplayName = "Load TF")
 	FVolDataLoadTransferFunctionParameters LoadTransferFunctionParameters;
 	UFUNCTION(CallInEditor, Category = "VolData")
 	void LoadTransferFunction();
+
+	UFUNCTION(CallInEditor, Category = "VolData", DisplayName = "Full Rebuild VDB")
+	void FullRebuildVDB();
 
 	void PostLoad() override;
 
 	std::shared_ptr<DepthBoxVDB::VolData::IVDBBuilder> GetVDBBuilder() const { return VDBBuilder; }
 	TSharedPtr<FVolDataVDBCPUData>					   GetCPUData() const { return CPUData; }
 
-	DECLARE_MULTICAST_DELEGATE_OneParam(FOnTransferFunctionChanged, UVolDataVDBComponent*);
+	DECLARE_MULTICAST_DELEGATE_OneParam(FTransferFunctionChanged, UVolDataVDBComponent*);
 
-	FOnTransferFunctionChanged OnTransferFunctionChanged;
+	FTransferFunctionChanged TransferFunctionChanged;
 
 #if WITH_EDITOR
 	void PostEditChangeProperty(struct FPropertyChangedEvent& PropertyChangedEvent) override;
 #endif
 
 private:
-	void setupTransferFunction();
+	void loadRAWVolume();
+	void loadTransferFunction();
+	void syncTransferFunctionFromCurve();
 	void buildVDB(bool bNeedReload = false, bool bNeedRelayoutAtlas = false);
 
 private:

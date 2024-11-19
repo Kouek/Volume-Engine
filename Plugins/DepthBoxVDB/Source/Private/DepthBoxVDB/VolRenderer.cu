@@ -151,6 +151,11 @@ __device__ static DepthBoxVDB::Ray GenRay(const glm::uvec3& DispatchThreadID,
 	return EyeRay;
 }
 
+struct CUDA_ALIGN IntersectionTestVDBParameters
+{
+	DepthBoxVDB::Ray::HitShellResult& HitShell;
+};
+
 struct CUDA_ALIGN OnChildPushedParameters
 {
 	float								 tEnter;
@@ -166,24 +171,33 @@ struct CUDA_ALIGN LeafEnteredParameters
 	const DepthBoxVDB::VolData::VDBNode& Node;
 };
 
-template <typename OnChildPushedType, typename OnSteppedType, typename LeafEnteredType>
+template <typename IntersectionTestType, typename OnChildPushedType, typename OnSteppedType,
+	typename LeafEnteredType>
 struct RayCastVDBCallbacks
 {
-	OnChildPushedType OnChildPushed;
-	OnSteppedType	  OnStepped;
-	LeafEnteredType	  LeafEntered;
+	IntersectionTestType IntersectionTest;
+	OnChildPushedType	 OnChildPushed;
+	OnSteppedType		 OnStepped;
+	LeafEnteredType		 LeafEntered;
 };
 
-template <typename OnChildPushedType, typename OnSteppedType, typename LeafEnteredType>
+template <typename IntersectionTestType, typename OnChildPushedType, typename OnSteppedType,
+	typename LeafEnteredType>
 __device__ static glm::vec4 RayCastVDB(const DepthBoxVDB::VolData::VDBData& VDBData,
 	const DepthBoxVDB::Ray&													EyeRay,
-	RayCastVDBCallbacks<OnChildPushedType, OnSteppedType, LeafEnteredType>	Callbacks)
+	RayCastVDBCallbacks<IntersectionTestType, OnChildPushedType, OnSteppedType, LeafEnteredType>
+		Callbacks)
 {
 	using namespace DepthBoxVDB;
 
 	const VolData::VDBParameters& VDBParams = VDBData.VDBParams;
 
-	Ray::HitShellResult HitShell = EyeRay.HitAABB(glm::vec3(0.f), VDBParams.VoxelPerVolume);
+	Ray::HitShellResult HitShell;
+	if constexpr (!std::is_same_v<IntersectionTestType, nullptr_t>)
+	{
+		IntersectionTestVDBParameters Params{ HitShell };
+		Callbacks.IntersectionTest(Params);
+	}
 	if (HitShell.tEnter >= HitShell.tExit)
 	{
 		return glm::vec4(0.f);
@@ -330,7 +344,11 @@ __device__ static glm::vec4 RenderScene(cudaTextureObject_t TransferFunctionText
 	glm::vec3 DeltaPos = RendererParams.Step * EyeRay.Direction;
 	int32_t	  StepNum = 1;
 
-	RayCastVDBCallbacks Callbacks = { /* OnChildPushed */ nullptr,
+	RayCastVDBCallbacks Callbacks = { /* IntersectionTest */
+		[&](IntersectionTestVDBParameters& Params) {
+			Params.HitShell = EyeRay.HitAABB(glm::vec3(0.f), glm::vec3(VDBParams.VoxelPerVolume));
+		},
+		/* OnChildPushed */ nullptr,
 		/* OnStepped */
 		[&]() { ScalarPrev = -1.f; },
 		/* LeafEntered */
@@ -402,7 +420,8 @@ __device__ static glm::vec4 RenderScene(cudaTextureObject_t TransferFunctionText
 			}
 
 			return false;
-		} };
+		}
+	};
 	RayCastVDB(VDBData, EyeRay, Callbacks);
 
 	return glm::vec4(Color, Alpha);
@@ -418,15 +437,21 @@ __device__ static glm::vec4 RenderAABB(
 	glm::vec3 Color(0.f);
 	float	  Alpha = 0.f;
 
-	RayCastVDBCallbacks Callbacks = {
-		/* OnChildPushed */ [&](const OnChildPushedParameters& Params) {
+	RayCastVDBCallbacks Callbacks = { /* IntersectionTest */
+		[&](IntersectionTestVDBParameters& Params) {
+			Params.HitShell = EyeRay.HitAABB(glm::vec3(0.f),
+				glm::vec3(VDBParams.ChildPerLevels[VDBParams.RootLevel]
+					* VDBParams.ChildCoverVoxelPerLevels[VDBParams.RootLevel]));
+		},
+		/* OnChildPushed */
+		[&](const OnChildPushedParameters& Params) {
 			if (Level != Params.Level)
 				return;
 
-			int32_t	  VoxelPerNode = Level == VDBParams.RootLevel
-				  ? VDBParams.ChildCoverVoxelPerLevels[Level] * VDBParams.ChildPerLevels[Level]
-				  : VDBParams.ChildCoverVoxelPerLevels[Level + 1];
-			glm::vec3 PosInBrick = EyeRay.Origin + Params.tEnter * EyeRay.Direction
+			int32_t		VoxelPerNode = Level == VDBParams.RootLevel
+					? VDBParams.ChildCoverVoxelPerLevels[Level] * VDBParams.ChildPerLevels[Level]
+					: VDBParams.ChildCoverVoxelPerLevels[Level + 1];
+			glm::vec3	PosInBrick = EyeRay.Origin + Params.tEnter * EyeRay.Direction
 				- glm::vec3(Params.Node.Coord * VoxelPerNode);
 
 			Color = Color + (1.f - Alpha) * .5f * PosInBrick / float(VoxelPerNode);
@@ -438,7 +463,7 @@ __device__ static glm::vec4 RenderAABB(
 			if (Level != 0)
 				return false;
 
-			glm::vec3 PosInBrick = EyeRay.Origin + Params.tEnter * EyeRay.Direction
+			glm::vec3	PosInBrick = EyeRay.Origin + Params.tEnter * EyeRay.Direction
 				- glm::vec3(Params.Node.Coord * VDBParams.ChildPerLevels[0]);
 
 			Color = Color + (1.f - Alpha) * .5f * PosInBrick / float(VDBParams.ChildPerLevels[0]);
@@ -454,6 +479,7 @@ __device__ static glm::vec4 RenderAABB(
 
 template <typename VoxelType>
 __device__ static glm::vec4 RenderDepthBox(
+	const DepthBoxVDB::VolRenderer::VDBRendererParameters& RendererParams,
 	const DepthBoxVDB::VolData::VDBData& VDBData, const DepthBoxVDB::Ray& EyeRay)
 {
 	using namespace DepthBoxVDB;
@@ -463,11 +489,18 @@ __device__ static glm::vec4 RenderDepthBox(
 	glm::vec3 Color(0.f);
 	float	  Alpha = 0.f;
 
-	RayCastVDBCallbacks Callbacks = { /* OnChildPushed */ nullptr,
+	RayCastVDBCallbacks Callbacks = { /* IntersectionTest */
+		[&](IntersectionTestVDBParameters& Params) {
+			Params.HitShell = EyeRay.HitAABB(glm::vec3(0.f),
+				glm::vec3(VDBParams.ChildPerLevels[VDBParams.RootLevel]
+					* VDBParams.ChildCoverVoxelPerLevels[VDBParams.RootLevel]));
+		},
+		/* OnChildPushed */ nullptr,
 		/* OnStepped */ nullptr,
 		/* LeafEntered */
-		[&](const LeafEnteredParameters& Params) {
-			glm::vec3 MinPosInBrick = glm::vec3(Params.Node.Coord * VDBParams.ChildPerLevels[0]);
+		[&](LeafEnteredParameters& Params) {
+			Params.tEnter = RendererParams.Step * glm::ceil(Params.tEnter / RendererParams.Step);
+			glm::vec3	MinPosInBrick = glm::vec3(Params.Node.Coord * VDBParams.ChildPerLevels[0]);
 			glm::vec3	PosInBrick = EyeRay.Origin + Params.tEnter * EyeRay.Direction - MinPosInBrick;
 			VolData::CoordType MinCoordInAtlasBrick =
 				Params.Node.CoordInAtlas * VDBParams.VoxelPerAtlasBrick
@@ -499,7 +532,8 @@ __device__ static glm::vec4 RenderDepthBox(
 			}
 
 			return true; // Break at the first leaf entered
-		} };
+		}
+	};
 	RayCastVDB(VDBData, EyeRay, Callbacks);
 
 	return glm::vec4(Color, Alpha);
@@ -641,7 +675,7 @@ void DepthBoxVDB::VolRenderer::VDBRenderer::render(
 					*VDBData, EyeRay);
 				break;
 			case ERenderTarget::DepthBox:
-				Color = RenderDepthBox<VoxelType>(*VDBData, EyeRay);
+				Color = RenderDepthBox<VoxelType>(*RendererParams, *VDBData, EyeRay);
 				break;
 			case ERenderTarget::PixelDepth:
 			{

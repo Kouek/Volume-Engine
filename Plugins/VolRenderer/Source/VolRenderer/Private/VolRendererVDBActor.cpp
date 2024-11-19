@@ -4,7 +4,7 @@ AVolRendererVDBActor::AVolRendererVDBActor(const FObjectInitializer&)
 {
 	VDBComponent = CreateDefaultSubobject<UVolDataVDBComponent>(TEXT("VDB"));
 	SetRootComponent(VDBComponent);
-	VDBComponent->OnTransferFunctionChanged.AddLambda([this](UVolDataVDBComponent* VDBComponent) {
+	VDBComponent->TransferFunctionChanged.AddLambda([this](UVolDataVDBComponent* VDBComponent) {
 		auto CPUData = VDBComponent->GetCPUData();
 		VDBRenderer->SetTransferFunction(CPUData->TransferFunctionData, CPUData->TransferFunctionDataPreIntegrated);
 	});
@@ -27,7 +27,7 @@ AVolRendererVDBActor::AVolRendererVDBActor(const FObjectInitializer&)
 		});
 
 	VDBRenderer = MakeShared<FVolRendererVDBRenderer>();
-	VDBRenderer->OnRenderSizeChanged_RenderThread.AddLambda([this](FIntPoint ActualRenderResolution) {
+	VDBRenderer->RenderSizeChanged_RenderThread.AddLambda([this](FIntPoint ActualRenderResolution) {
 		VDBRendererParamsCS.Lock();
 
 		VDBRendererParams.RenderResolution = ActualRenderResolution;

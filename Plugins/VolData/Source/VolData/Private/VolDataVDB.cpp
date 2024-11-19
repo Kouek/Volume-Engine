@@ -1,5 +1,8 @@
 #include "VolDataVDB.h"
 
+#include <array>
+#include <tuple>
+
 #include "DesktopPlatformModule.h"
 
 #include "VolDataRAWVolume.h"
@@ -114,6 +117,56 @@ FVolDataVDBParameters::operator DepthBoxVDB::VolData::VDBParameters()
 
 UVolDataVDBComponent::UVolDataVDBComponent(const FObjectInitializer&)
 {
+	TransferFunctionCurve = CreateDefaultSubobject<UCurveLinearColor>(TEXT("TF Curve"));
+	{
+		std::array<FRichCurve*, 4> Curves{ &TransferFunctionCurve->FloatCurves[0],
+			&TransferFunctionCurve->FloatCurves[1], &TransferFunctionCurve->FloatCurves[2],
+			&TransferFunctionCurve->FloatCurves[3] };
+
+		using RGBAType = std::array<float, 4>;
+		std::array<std::tuple<float, RGBAType>, 3> InitialPoints{ std::make_tuple(0.f, RGBAType{ 0.f, 0.f, 0.f, 0.f }),
+			std::make_tuple(30.f, RGBAType{ 0.f, 0.f, 0.f, 0.f }),
+			std::make_tuple(255.f, RGBAType{ 1.f, .5f, .2f, 1.f }) };
+		for (auto& [Scalar, RGBA] : InitialPoints)
+			for (int32 Cmpt = 0; Cmpt < 4; ++Cmpt)
+			{
+				Curves[Cmpt]->AddKey(Scalar, RGBA[Cmpt]);
+			}
+
+		TransferFunctionCurve->OnUpdateCurve.AddLambda([this](UCurveBase* Curve, EPropertyChangeType::Type ChangeType) {
+			std::array<FRichCurve*, 4> Curves{ &TransferFunctionCurve->FloatCurves[0],
+				&TransferFunctionCurve->FloatCurves[1], &TransferFunctionCurve->FloatCurves[2],
+				&TransferFunctionCurve->FloatCurves[3] };
+			TMap<FKeyHandle, uint8>	   KeysOutOfRange;
+			for (int32 Cmpt = 0; Cmpt < 4; ++Cmpt)
+			{
+				KeysOutOfRange.Empty();
+				auto KeyHandleItr = Curves[Cmpt]->GetKeyHandleIterator();
+				auto KeyItr = Curves[Cmpt]->GetKeyIterator();
+				while (KeyItr)
+				{
+					if (KeyItr->Time < 0.f)
+						KeysOutOfRange.Emplace(*KeyHandleItr, 0);
+					else if (KeyItr->Time > LoadTransferFunctionParameters.MaxScalarInTF)
+						KeysOutOfRange.Emplace(*KeyHandleItr, 1);
+
+					++KeyItr;
+					++KeyHandleItr;
+				}
+
+				for (auto& [Handle, State] : KeysOutOfRange)
+				{
+					if (State == 0)
+						Curves[Cmpt]->SetKeyTime(Handle, 0.f);
+					else
+						Curves[Cmpt]->SetKeyTime(Handle, LoadTransferFunctionParameters.MaxScalarInTF);
+				}
+			}
+
+			syncTransferFunctionFromCurve();
+		});
+	}
+
 	CPUData = MakeShared<FVolDataVDBCPUData>();
 	VDBBuilder = DepthBoxVDB::VolData::IVDBBuilder::Create({});
 }
@@ -148,6 +201,11 @@ void UVolDataVDBComponent::LoadTransferFunction()
 	buildVDB();
 }
 
+void UVolDataVDBComponent::FullRebuildVDB()
+{
+	buildVDB(false, true);
+}
+
 void UVolDataVDBComponent::PostLoad()
 {
 	Super::PostLoad();
@@ -174,33 +232,69 @@ void UVolDataVDBComponent::PostEditChangeProperty(FPropertyChangedEvent& Propert
 }
 #endif
 
-void UVolDataVDBComponent::setupTransferFunction()
+void UVolDataVDBComponent::loadRAWVolume()
 {
-	CPUData->EmptyScalarRanges.Empty();
+	// Temporarily support RAW Volume only
+	CPUData->RAWVolumeData.Empty();
 
-	auto DataOrErrMsg = FVolDataTransferFunction::LoadFromFile(
-		FVolDataTransferFunction::LoadFromFileParameters<true>{ .Resolution = LoadTransferFunctionParameters.Resolution,
-			.SourcePath = LoadTransferFunctionParameters.SourcePath });
+	auto DataOrErrMsg = FVolDataRAWVolumeData::LoadFromFile({ .VoxelType = LoadRAWVolumeParams.VoxelType,
+		.VoxelPerVolume = LoadRAWVolumeParams.VoxelPerVolume,
+		.AxisOrder = LoadRAWVolumeParams.AxisOrder,
+		.SourcePath = LoadRAWVolumeParams.SourcePath });
 	if (DataOrErrMsg.IsType<FString>())
 	{
 		UE_LOG(LogVolData, Error, TEXT("%s"), *DataOrErrMsg.Get<FString>());
 		return;
 	}
-	auto&					 Data = DataOrErrMsg.Get<TArray<FFloat16>>();
-	std::array<FFloat16, 4>* TypedData = reinterpret_cast<std::array<FFloat16, 4>*>(Data.GetData());
 
+	CPUData->RAWVolumeData = std::move(DataOrErrMsg.Get<TArray<uint8>>());
+	CPUData->VoxelPerVolume =
+		VolData::ReorderVoxelPerVolume(LoadRAWVolumeParams.VoxelPerVolume, LoadRAWVolumeParams.AxisOrder)
+			.GetValue()
+			.Get<1>();
+}
+
+void UVolDataVDBComponent::loadTransferFunction()
+{
+	// Load from file
+	auto DataOrErrMsg =
+		FVolDataTransferFunction::LoadFromFile({ .SourcePath = LoadTransferFunctionParameters.SourcePath });
+	if (DataOrErrMsg.IsType<FString>())
 	{
-		uint32_t EmptyRange[2] = { LoadTransferFunctionParameters.Resolution, 0 };
+		UE_LOG(LogVolData, Error, TEXT("%s"), *DataOrErrMsg.Get<FString>());
+		return;
+	}
+
+	// Setup Curve
+	auto& Data = DataOrErrMsg.Get<TMap<float, FVector4f>>();
+	LoadTransferFunctionParameters.MaxScalarInTF = 0.f;
+	{
+		TransferFunctionCurve->ResetCurve();
+		std::array<FRichCurve*, 4> Curves{ &TransferFunctionCurve->FloatCurves[0],
+			&TransferFunctionCurve->FloatCurves[1], &TransferFunctionCurve->FloatCurves[2],
+			&TransferFunctionCurve->FloatCurves[3] };
+
+		for (auto& [Scalar, RGBA] : Data)
+			for (int32 Cmpt = 0; Cmpt < 4; ++Cmpt)
+			{
+				Curves[Cmpt]->AddKey(Scalar, RGBA[Cmpt]);
+				LoadTransferFunctionParameters.MaxScalarInTF =
+					FMath::Max(LoadTransferFunctionParameters.MaxScalarInTF, Scalar);
+			}
+	}
+
+	// Get Empty Scalar Ranges
+	{
+		std::array<float, 2> EmptyRange{ LoadTransferFunctionParameters.MaxScalarInTF, 0 };
 		CPUData->EmptyScalarRanges.Empty();
 		CPUData->EmptyScalarRangeNum = 0;
 		auto Append = [&]() {
 			CPUData->EmptyScalarRanges.Add(glm::vec2(EmptyRange[0], EmptyRange[1]));
 			++CPUData->EmptyScalarRangeNum;
 		};
-		for (uint32 Scalar = 0; Scalar < LoadTransferFunctionParameters.Resolution; ++Scalar)
+		for (auto& [Scalar, RGBA] : Data)
 		{
-			std::array<FFloat16, 4>& RGBA = TypedData[Scalar];
-			bool					 bCurrEmpty = RGBA[3] <= std::numeric_limits<float>::epsilon();
+			bool bCurrEmpty = RGBA.W <= std::numeric_limits<float>::epsilon();
 			if (bCurrEmpty)
 			{
 				EmptyRange[0] = std::min(Scalar, EmptyRange[0]);
@@ -209,7 +303,7 @@ void UVolDataVDBComponent::setupTransferFunction()
 			else if (EmptyRange[0] < EmptyRange[1])
 			{
 				Append();
-				EmptyRange[0] = LoadTransferFunctionParameters.Resolution;
+				EmptyRange[0] = LoadTransferFunctionParameters.MaxScalarInTF;
 				EmptyRange[1] = 0;
 			}
 		}
@@ -218,59 +312,69 @@ void UVolDataVDBComponent::setupTransferFunction()
 			Append();
 		}
 	}
+}
 
-	auto TexOrErrMsg = FVolDataTransferFunction::CreateTexture(
-		{ .Resolution = LoadTransferFunctionParameters.Resolution, .TFFlatArray = Data });
-	if (TexOrErrMsg.IsType<FString>())
+void UVolDataVDBComponent::syncTransferFunctionFromCurve()
+{
+	// Get flatten data from Curve
+	TArray<FFloat16> FlattenDataHalfPrecision;
+	TArray<float>	 FlattenDataFullPrecision;
 	{
-		UE_LOG(LogVolData, Error, TEXT("%s"), *TexOrErrMsg.Get<FString>());
-		return;
+		FlattenDataHalfPrecision.Reserve(4 * LoadTransferFunctionParameters.Resolution);
+		FlattenDataFullPrecision.Reserve(4 * LoadTransferFunctionParameters.Resolution);
+		float KeyIdxToScalar =
+			LoadTransferFunctionParameters.MaxScalarInTF / (LoadTransferFunctionParameters.Resolution - 1);
+		for (uint32 KeyIdx = 0; KeyIdx < LoadTransferFunctionParameters.Resolution; ++KeyIdx)
+		{
+			float		 Scalar = KeyIdx * KeyIdxToScalar;
+			FLinearColor RGBA = TransferFunctionCurve->GetLinearColorValue(Scalar);
+			for (int32 Cmpt = 0; Cmpt < 4; ++Cmpt)
+			{
+				float Value = Cmpt == 0 ? RGBA.R : Cmpt == 1 ? RGBA.G : Cmpt == 2 ? RGBA.B : RGBA.A;
+				FlattenDataHalfPrecision.Emplace(Value);
+				FlattenDataFullPrecision.Emplace(Value);
+			}
+		}
 	}
-	TransferFunction = TexOrErrMsg.Get<UTexture2D*>();
 
-	TexOrErrMsg = FVolDataTransferFunction::CreateTexturePreIntegrated(
-		{ .Resolution = LoadTransferFunctionParameters.Resolution, .TFFlatArray = Data });
-	if (TexOrErrMsg.IsType<FString>())
+	// Setup Texture
 	{
-		UE_LOG(LogVolData, Error, TEXT("%s"), *TexOrErrMsg.Get<FString>());
-		return;
+		auto TexOrErrMsg = FVolDataTransferFunction::CreateTexture(
+			{ .Resolution = LoadTransferFunctionParameters.Resolution, .TFFlatArray = FlattenDataHalfPrecision });
+		if (TexOrErrMsg.IsType<FString>())
+		{
+			UE_LOG(LogVolData, Error, TEXT("%s"), *TexOrErrMsg.Get<FString>());
+			return;
+		}
+		TransferFunction = TexOrErrMsg.Get<UTexture2D*>();
 	}
-	TransferFunctionPreIntegrated = TexOrErrMsg.Get<UTexture2D*>();
 
-	CPUData->TransferFunctionData =
-		FVolDataTransferFunction::LoadFromFile(FVolDataTransferFunction::LoadFromFileParameters<false>{
-												   .Resolution = LoadTransferFunctionParameters.Resolution,
-												   .SourcePath = LoadTransferFunctionParameters.SourcePath })
-			.Get<TArray<float>>();
+	// Setup Pre-integrated Texture
+	{
+		auto TexOrErrMsg = FVolDataTransferFunction::CreateTexturePreIntegrated(
+			{ .Resolution = LoadTransferFunctionParameters.Resolution, .TFFlatArray = FlattenDataHalfPrecision });
+		if (TexOrErrMsg.IsType<FString>())
+		{
+			UE_LOG(LogVolData, Error, TEXT("%s"), *TexOrErrMsg.Get<FString>());
+			return;
+		}
+		TransferFunctionPreIntegrated = TexOrErrMsg.Get<UTexture2D*>();
+	}
+
+	// Save copy of TF in CPU
+	CPUData->TransferFunctionData = std::move(FlattenDataFullPrecision);
 	CPUData->TransferFunctionDataPreIntegrated = FVolDataTransferFunction::PreIntegrateFromFlatArray<false>(
 		CPUData->TransferFunctionData, LoadTransferFunctionParameters.Resolution);
 
-	OnTransferFunctionChanged.Broadcast(this);
+	TransferFunctionChanged.Broadcast(this);
 }
 
 void UVolDataVDBComponent::buildVDB(bool bNeedReload, bool bNeedRelayoutAtlas)
 {
-	// Temporarily support RAW Volume only
 	bool bNeedFullRebuild = bNeedRelayoutAtlas;
 	if (bNeedReload || LoadRAWVolumeParams.bNeedReload)
 	{
-		CPUData->RAWVolumeData.Empty();
-
-		auto DataOrErrMsg = FVolDataRAWVolumeData::LoadFromFile({ .VoxelType = LoadRAWVolumeParams.VoxelType,
-			.VoxelPerVolume = LoadRAWVolumeParams.VoxelPerVolume,
-			.AxisOrder = LoadRAWVolumeParams.AxisOrder,
-			.SourcePath = LoadRAWVolumeParams.SourcePath });
-		if (DataOrErrMsg.IsType<FString>())
-		{
-			UE_LOG(LogVolData, Error, TEXT("%s"), *DataOrErrMsg.Get<FString>());
-			return;
-		}
-
-		CPUData->RAWVolumeData = std::move(DataOrErrMsg.Get<TArray<uint8>>());
-		CPUData->VoxelPerVolume =
-			VolData::ReorderVoxelPerVolume(LoadRAWVolumeParams.VoxelPerVolume, LoadRAWVolumeParams.AxisOrder)
-				.GetValue()
-				.Get<1>();
+		loadRAWVolume();
 
 		LoadRAWVolumeParams.bNeedReload = false;
 		bNeedFullRebuild = true;
@@ -278,7 +382,8 @@ void UVolDataVDBComponent::buildVDB(bool bNeedReload, bool bNeedRelayoutAtlas)
 
 	if (bNeedReload || LoadTransferFunctionParameters.bNeedReload)
 	{
-		setupTransferFunction();
+		loadTransferFunction();
+		syncTransferFunctionFromCurve();
 
 		LoadTransferFunctionParameters.bNeedReload = false;
 		bNeedFullRebuild |= LoadTransferFunctionParameters.bNeedFullRebuild;

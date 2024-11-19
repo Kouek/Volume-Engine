@@ -9,34 +9,31 @@
 class FVolDataTransferFunction
 {
 public:
-	template <bool bUseHalf> struct LoadFromFileParameters
+	struct LoadFromFileParameters
 	{
-		struct RetValueTrait
-		{
-			auto operator()()
-			{
-				if constexpr (bUseHalf)
-					return TArray<FFloat16>();
-				else
-					return TArray<float>();
-			}
-		};
-		using RetValueType = std::invoke_result_t<RetValueTrait>;
+		using RetValueType = TMap<float, FVector4f>;
 
-		uint32	  Resolution;
 		FFilePath SourcePath;
 	};
-	template <bool bUseHalf>
-	static TVariant<typename LoadFromFileParameters<bUseHalf>::RetValueType, FString> LoadFromFile(
-		const LoadFromFileParameters<bUseHalf>& Params);
+	static TVariant<typename LoadFromFileParameters::RetValueType, FString> LoadFromFile(
+		const LoadFromFileParameters& Params);
+
+	template <bool bUseHalf> struct FlattenDataTrait
+	{
+		auto operator()()
+		{
+			if constexpr (bUseHalf)
+				return TArray<FFloat16>();
+			else
+				return TArray<float>();
+		}
+
+		using Type = std::invoke_result_t<FlattenDataTrait>;
+	};
 
 	template <bool bUseHalf>
-	static LoadFromFileParameters<bUseHalf>::RetValueType LerpFromPointsToFlatArray(
-		const TMap<float, FVector4f>& Points, uint32 Resolution = 256);
-
-	template <bool bUseHalf>
-	static LoadFromFileParameters<bUseHalf>::RetValueType PreIntegrateFromFlatArray(
-		const typename LoadFromFileParameters<bUseHalf>::RetValueType& Array, uint32 Resolution = 256);
+	static FlattenDataTrait<bUseHalf>::Type PreIntegrateFromFlatArray(
+		const typename FlattenDataTrait<bUseHalf>::Type& Array, uint32 Resolution = 256);
 
 	struct CreateTextureParameters
 	{
