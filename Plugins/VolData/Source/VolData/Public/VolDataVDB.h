@@ -109,13 +109,13 @@ class VOLDATA_API UVolDataVDBComponent : public USceneComponent
 public:
 	UVolDataVDBComponent(const FObjectInitializer&);
 
-	UPROPERTY(EditAnywhere, Category = "VolData")
+	UPROPERTY(EditAnywhere, Category = "VolData", DisplayName = "VDB")
 	FVolDataVDBParameters VDBParams;
 	UPROPERTY(VisibleAnywhere, Transient, Category = "VolData")
 	TObjectPtr<UTexture2D> TransferFunction = nullptr;
 	UPROPERTY(VisibleAnywhere, Transient, Category = "VolData")
 	TObjectPtr<UTexture2D> TransferFunctionPreIntegrated = nullptr;
-	UPROPERTY(VisibleAnywhere, Transient, Category = "VIS4Earth")
+	UPROPERTY(VisibleAnywhere, Transient, Category = "VolData")
 	TObjectPtr<UCurveLinearColor> TransferFunctionCurve = nullptr;
 
 	UPROPERTY(EditAnywhere, Category = "VolData", DisplayName = "Load RAW Vol")

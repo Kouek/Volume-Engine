@@ -3,6 +3,7 @@
 #include "GameFramework/Actor.h"
 
 #include "VolDataVDB.h"
+#include "VolDeformTetrahedralActor.h"
 #include "VolRendererVDBRenderer.h"
 
 #include "VolRendererVDBActor.generated.h"
@@ -13,10 +14,13 @@ class VOLRENDERER_API AVolRendererVDBActor : public AActor
 	GENERATED_BODY()
 
 public:
-	UPROPERTY(EditAnywhere)
+	UPROPERTY(EditAnywhere, Category = "VolRenderer", DisplayName = "VDB Renderer")
 	FVolRendererVDBRendererParameters VDBRendererParams;
-	UPROPERTY(EditAnywhere)
+	UPROPERTY(VisibleAnywhere, Category = "VolRenderer")
 	TObjectPtr<UVolDataVDBComponent> VDBComponent;
+
+	UPROPERTY(EditAnywhere, Category = "VolDeform")
+	TObjectPtr<AVolDeformTetrahedralActor> TetrahedralActor;
 
 	AVolRendererVDBActor(const FObjectInitializer&);
 	~AVolRendererVDBActor();
@@ -30,6 +34,9 @@ public:
 #endif
 
 private:
+	void updateVoxelSpaces();
+	void updateVisibleBox();
+
 	void setupRenderer();
 	void clearRenderer();
 	void clearResource();

@@ -58,6 +58,8 @@ struct FVolRendererVDBRendererParameters
 	UPROPERTY(EditAnywhere)
 	bool bUseDepthOcclusion = true;
 	UPROPERTY(EditAnywhere)
+	bool bHighlightDeformRegion = false;
+	UPROPERTY(EditAnywhere)
 	int32 RenderResolutionLOD = 1;
 	UPROPERTY(EditAnywhere)
 	int32 MaxStepNum = 3000;
@@ -69,8 +71,18 @@ struct FVolRendererVDBRendererParameters
 	float MaxAlpha = .95f;
 	UPROPERTY(VisibleAnywhere)
 	FVector InvVoxelSpaces = { 1., 1., 1. };
+	UPROPERTY(VisibleAnywhere)
+	FVector VisibleBoxMinPositionToLocal = FVector::OneVector;
+	UPROPERTY(VisibleAnywhere)
+	FVector VisibleBoxMaxPositionToLocal = FVector::ZeroVector;
 
 	FTransform Transform;
+
+	void ResetVisibleBox()
+	{
+		VisibleBoxMinPositionToLocal = FVector::OneVector;
+		VisibleBoxMaxPositionToLocal = FVector::ZeroVector;
+	}
 
 	TOptional<FString> InitializeAndCheck();
 
@@ -80,6 +92,8 @@ struct FVolRendererVDBRendererParameters
 class VOLRENDERER_API FVolRendererVDBRenderer : public TSharedFromThis<FVolRendererVDBRenderer>
 {
 public:
+	static void AssignLeftHandedToRight(glm::vec3& Rht, const FVector& Lft);
+
 	FVolRendererVDBRenderer();
 	~FVolRendererVDBRenderer();
 

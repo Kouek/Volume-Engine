@@ -641,7 +641,6 @@ void DepthBoxVDB::VolData::VDBBuilder::relayoutRAWVolume(const FullBuildParamete
 	};
 
 	{
-
 		uint32_t  BrickIndex = 0;
 		CoordType BrickCoord;
 		for (BrickCoord.z = 0; BrickCoord.z < VDBParams.BrickPerVolume.z; ++BrickCoord.z)

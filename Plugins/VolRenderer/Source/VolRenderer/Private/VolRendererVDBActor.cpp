@@ -10,20 +10,9 @@ AVolRendererVDBActor::AVolRendererVDBActor(const FObjectInitializer&)
 	});
 	VDBComponent->TransformUpdated.AddLambda(
 		[this](USceneComponent* SceneComponent, EUpdateTransformFlags, ETeleportType) {
-			VDBRendererParamsCS.Lock();
-
-			VDBRendererParams.Transform = SceneComponent->GetRelativeTransform();
-			VDBRendererParams.InvVoxelSpaces = FVector::One() / VDBRendererParams.Transform.GetScale3D();
-			auto ErrMsgOpt = VDBRendererParams.InitializeAndCheck();
-
-			VDBRendererParamsCS.Unlock();
-			if (ErrMsgOpt.IsSet())
-			{
-				UE_LOG(LogVolRenderer, Error, TEXT("%s"), *ErrMsgOpt.GetValue());
-				return;
-			}
-
-			VDBRenderer->SetParameters(VDBRendererParams);
+			updateVoxelSpaces();
+			updateVisibleBox();
+			setupRenderer();
 		});
 
 	VDBRenderer = MakeShared<FVolRendererVDBRenderer>();
@@ -47,6 +36,16 @@ void AVolRendererVDBActor::PostLoad()
 
 	VDBRenderer->Register();
 
+	if (TetrahedralActor)
+	{
+		TetrahedralActor->BoundingBoxChanged.AddLambda([this](AVolDeformTetrahedralActor*) {
+			updateVisibleBox();
+			setupRenderer();
+		});
+	}
+
+	updateVoxelSpaces();
+	updateVisibleBox();
 	setupRenderer();
 }
 
@@ -67,6 +66,20 @@ void AVolRendererVDBActor::PostEditChangeProperty(FPropertyChangedEvent& Propert
 	if (PropertyChangedEvent.GetMemberPropertyName()
 		== GET_MEMBER_NAME_CHECKED(AVolRendererVDBActor, VDBRendererParams))
 	{
+		setupRenderer();
+	}
+
+	if (PropertyChangedEvent.GetMemberPropertyName() == GET_MEMBER_NAME_CHECKED(AVolRendererVDBActor, TetrahedralActor))
+	{
+		if (TetrahedralActor)
+		{
+			TetrahedralActor->BoundingBoxChanged.AddLambda([this](AVolDeformTetrahedralActor*) {
+				updateVisibleBox();
+				setupRenderer();
+			});
+		}
+
+		updateVisibleBox();
 		setupRenderer();
 	}
 }
@@ -102,4 +115,36 @@ void AVolRendererVDBActor::clearRenderer()
 void AVolRendererVDBActor::clearResource()
 {
 	clearRenderer();
+}
+
+void AVolRendererVDBActor::updateVoxelSpaces()
+{
+	VDBRendererParamsCS.Lock();
+
+	VDBRendererParams.Transform = VDBComponent->GetRelativeTransform();
+	VDBRendererParams.InvVoxelSpaces = FVector::One() / VDBRendererParams.Transform.GetScale3D();
+
+	VDBRendererParamsCS.Unlock();
+}
+
+void AVolRendererVDBActor::updateVisibleBox()
+{
+	if (!TetrahedralActor)
+	{
+		VDBRendererParamsCS.Lock();
+		VDBRendererParams.ResetVisibleBox();
+		VDBRendererParamsCS.Unlock();
+
+		return;
+	}
+
+	VDBRendererParamsCS.Lock();
+
+	const FTransform& TATr = TetrahedralActor->GetTransform();
+	const FTransform& VDBTr = GetTransform();
+	VDBRendererParams.VisibleBoxMinPositionToLocal = TATr.GetLocation() - VDBTr.GetLocation();
+	VDBRendererParams.VisibleBoxMaxPositionToLocal =
+		VDBRendererParams.VisibleBoxMinPositionToLocal + TetrahedralActor->TetrahedralMeshParams.Extent;
+
+	VDBRendererParamsCS.Unlock();
 }

@@ -344,9 +344,13 @@ __device__ static glm::vec4 RenderScene(cudaTextureObject_t TransferFunctionText
 	glm::vec3 DeltaPos = RendererParams.Step * EyeRay.Direction;
 	int32_t	  StepNum = 1;
 
+	glm::vec3 AABBMinPosition = glm::max(glm::vec3(0.f), RendererParams.VisibleAABBMinPosition);
+	glm::vec3 AABBMaxPosition =
+		glm::min(glm::vec3(VDBParams.VoxelPerVolume), RendererParams.VisibleAABBMaxPosition);
+
 	RayCastVDBCallbacks Callbacks = { /* IntersectionTest */
 		[&](IntersectionTestVDBParameters& Params) {
-			Params.HitShell = EyeRay.HitAABB(glm::vec3(0.f), glm::vec3(VDBParams.VoxelPerVolume));
+			Params.HitShell = EyeRay.HitAABB(AABBMinPosition, AABBMaxPosition);
 		},
 		/* OnChildPushed */ nullptr,
 		/* OnStepped */

@@ -40,6 +40,8 @@ namespace DepthBoxVDB
 			float		  MaxStepDist;
 			float		  MaxAlpha;
 			glm::vec3	  InvVoxelSpaces;
+			glm::vec3	  VisibleAABBMinPosition;
+			glm::vec3	  VisibleAABBMaxPosition;
 		};
 
 		class IVDBRenderer : Noncopyable

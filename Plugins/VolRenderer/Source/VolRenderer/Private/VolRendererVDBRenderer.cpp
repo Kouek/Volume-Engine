@@ -48,12 +48,40 @@ FVolRendererVDBRendererParameters::operator DepthBoxVDB::VolRenderer::VDBRendere
 	ASSIGN(MaxStepDist);
 	ASSIGN(MaxAlpha);
 
-	for (int32 i = 0; i < 3; ++i)
+	for (int32 Axis = 0; Axis < 3; ++Axis)
 	{
-		ASSIGN(InvVoxelSpaces[i]);
+		ASSIGN(InvVoxelSpaces[Axis]);
 	}
 
 #undef ASSIGN
+
+	bool bIsVisibleBoxValid = bHighlightDeformRegion;
+	for (int32 Axis = 0; Axis < 3; ++Axis)
+	{
+		if (VisibleBoxMinPositionToLocal[Axis] > VisibleBoxMaxPositionToLocal[Axis])
+		{
+			bIsVisibleBoxValid = false;
+			break;
+		}
+	}
+
+	if (bIsVisibleBoxValid)
+	{
+		// Clip within VisibleAABB
+		glm::vec3 P0, P1;
+		FVolRendererVDBRenderer::AssignLeftHandedToRight(P0, VisibleBoxMinPositionToLocal);
+		FVolRendererVDBRenderer::AssignLeftHandedToRight(P1, VisibleBoxMaxPositionToLocal);
+		P0 = Ret.InvVoxelSpaces * P0;
+		P1 = Ret.InvVoxelSpaces * P1;
+		Ret.VisibleAABBMinPosition = glm::min(P0, P1);
+		Ret.VisibleAABBMaxPosition = glm::max(P0, P1);
+	}
+	else
+	{
+		// No Clipping
+		Ret.VisibleAABBMinPosition = glm::vec3(0.f);
+		Ret.VisibleAABBMaxPosition = glm::vec3(std::numeric_limits<float>::max());
+	}
 
 	return Ret;
 }
@@ -124,6 +152,18 @@ public:
 };
 
 IMPLEMENT_GLOBAL_SHADER(FCompositionCS, "/VolRenderer/Composition.usf", "Main", SF_Compute);
+
+void FVolRendererVDBRenderer::AssignLeftHandedToRight(glm::vec3& Rht, const FVector& Lft)
+{
+	/*
+	 * | 0 1 0|   |x|   | y|
+	 * | 0 0 1| * |y| = | z|
+	 * |-1 0 0|   |z|L  |-x|R
+	 */
+	Rht.x = +Lft.Y;
+	Rht.y = +Lft.Z;
+	Rht.z = -Lft.X;
+}
 
 FVolRendererVDBRenderer::FVolRendererVDBRenderer()
 {
@@ -309,16 +349,6 @@ void FVolRendererVDBRenderer::Render_RenderThread(FPostOpaqueRenderParameters& P
 
 		auto ShaderParametersMetadata = FBarrierShaderParameters::FTypeInfo::GetStructMetadata();
 
-		/*
-		 * | 0 1 0|   |x|   | y|
-		 * | 0 0 1| * |y| = | z|
-		 * |-1 0 0|   |z|L  |-x|R
-		 */
-		auto AssignLeftHandedToRight = [](glm::vec3& Rht, const FVector& Lft) {
-			Rht.x = +Lft.Y;
-			Rht.y = +Lft.Z;
-			Rht.z = -Lft.X;
-		};
 		glm::vec3 CameraPositionToLoacl;
 		{
 			const FVector& CameraPos = Params.View->ViewMatrices.GetViewOrigin();

@@ -1,22 +1,22 @@
 {
-	"FileVersion": 3,
-	"EngineAssociation": "{CE0C9DB6-4CB7-A677-C408-FFBEEEDB9A2B}",
-	"Category": "",
-	"Description": "",
-	"Modules": [
-		{
-			"Name": "VolDeform",
-			"Type": "Runtime",
-			"LoadingPhase": "Default"
-		}
-	],
-	"Plugins": [
-		{
-			"Name": "ModelingToolsEditorMode",
-			"Enabled": true,
-			"TargetAllowList": [
-				"Editor"
-			]
-		}
-	]
+  "FileVersion": 3,
+  "EngineAssociation": "{CE0C9DB6-4CB7-A677-C408-FFBEEEDB9A2B}",
+  "Category": "",
+  "Description": "",
+  "Modules": [
+    {
+      "Name": "Demo",
+      "Type": "Runtime",
+      "LoadingPhase": "Default"
+    }
+  ],
+  "Plugins": [
+    {
+      "Name": "ModelingToolsEditorMode",
+      "Enabled": true,
+      "TargetAllowList": [
+        "Editor"
+      ]
+    }
+  ]
 }

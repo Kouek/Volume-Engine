@@ -2,9 +2,9 @@
 
 using UnrealBuildTool;
 
-public class VolRenderer : ModuleRules
+public class VolDeform : ModuleRules
 {
-    public VolRenderer(ReadOnlyTargetRules Target) : base(Target)
+    public VolDeform(ReadOnlyTargetRules Target) : base(Target)
     {
         PCHUsage = ModuleRules.PCHUsageMode.UseExplicitOrSharedPCHs;
 
@@ -26,12 +26,7 @@ public class VolRenderer : ModuleRules
             new string[]
             {
                 "Core",
-                "RenderCore",
-                "RHI",
-                "UnrealEd",
 				// ... add other public dependencies that you statically link with here ...
-                "VolData",
-                "VolDeform"
             }
             );
 
@@ -54,7 +49,5 @@ public class VolRenderer : ModuleRules
 				// ... add any modules that your module loads dynamically here ...
 			}
             );
-
-        CppStandard = CppStandardVersion.Cpp20;
     }
 }
