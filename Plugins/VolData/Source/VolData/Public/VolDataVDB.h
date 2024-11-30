@@ -133,8 +133,8 @@ public:
 
 	void PostLoad() override;
 
-	std::shared_ptr<DepthBoxVDB::VolData::IVDBBuilder> GetVDBBuilder() const { return VDBBuilder; }
-	TSharedPtr<FVolDataVDBCPUData>					   GetCPUData() const { return CPUData; }
+	std::shared_ptr<DepthBoxVDB::VolData::IVDB> GetVDB() const { return VDB; }
+	TSharedPtr<FVolDataVDBCPUData>				GetCPUData() const { return CPUData; }
 
 	DECLARE_MULTICAST_DELEGATE_OneParam(FTransferFunctionChanged, UVolDataVDBComponent*);
 
@@ -153,5 +153,5 @@ private:
 private:
 	TSharedPtr<FVolDataVDBCPUData> CPUData;
 
-	std::shared_ptr<DepthBoxVDB::VolData::IVDBBuilder> VDBBuilder;
+	std::shared_ptr<DepthBoxVDB::VolData::IVDB> VDB;
 };

@@ -33,13 +33,13 @@ TOptional<FString> FVolRendererVDBRendererParameters::InitializeAndCheck()
 	return {};
 }
 
-FVolRendererVDBRendererParameters::operator DepthBoxVDB::VolRenderer::VDBRendererParameters()
+FVolRendererVDBRendererParameters::operator DepthBoxVDB::VolRenderer::IVDBRenderer::RendererParameters()
 {
-	DepthBoxVDB::VolRenderer::VDBRendererParameters Ret;
+	DepthBoxVDB::VolRenderer::IVDBRenderer::RendererParameters Ret;
 
 #define ASSIGN(Member) Ret.Member = Member
 
-	Ret.RenderTarget = (DepthBoxVDB::VolRenderer::ERenderTarget)(uint8)RenderTarget;
+	Ret.RenderTarget = (DepthBoxVDB::VolRenderer::EVDBRenderTarget)(uint8)RenderTarget;
 	ASSIGN(bUseDepthBox);
 	ASSIGN(bUsePreIntegratedTF);
 	ASSIGN(bUseDepthOcclusion);
@@ -55,7 +55,7 @@ FVolRendererVDBRendererParameters::operator DepthBoxVDB::VolRenderer::VDBRendere
 
 #undef ASSIGN
 
-	bool bIsVisibleBoxValid = bHighlightDeformRegion;
+	bool bIsVisibleBoxValid = bClipByVisibleBox;
 	for (int32 Axis = 0; Axis < 3; ++Axis)
 	{
 		if (VisibleBoxMinPositionToLocal[Axis] > VisibleBoxMaxPositionToLocal[Axis])
@@ -167,8 +167,9 @@ void FVolRendererVDBRenderer::AssignLeftHandedToRight(glm::vec3& Rht, const FVec
 
 FVolRendererVDBRenderer::FVolRendererVDBRenderer()
 {
-	VDBRenderer = DepthBoxVDB::VolRenderer::IVDBRenderer::Create(
-		{ .RHIType = DepthBoxVDB::VolRenderer::CastFromRHIInterfaceType(GDynamicRHI->GetInterfaceType()) });
+	DepthBoxVDB::VolRenderer::IVDBRenderer::CreateParameters Params;
+	Params.RHIType = DepthBoxVDB::VolRenderer::CastFromRHIInterfaceType(GDynamicRHI->GetInterfaceType());
+	VDBRenderer = DepthBoxVDB::VolRenderer::IVDBRenderer::Create(Params);
 }
 
 FVolRendererVDBRenderer::~FVolRendererVDBRenderer() {}
@@ -197,11 +198,10 @@ void FVolRendererVDBRenderer::Unregister()
 	});
 }
 
-void FVolRendererVDBRenderer::SetVDBBuilder(std::shared_ptr<DepthBoxVDB::VolData::IVDBBuilder> InVDBBuilder)
+void FVolRendererVDBRenderer::SetVDB(std::shared_ptr<DepthBoxVDB::VolData::IVDB> InVDB)
 {
 	ENQUEUE_RENDER_COMMAND(SetVDBBuilder)
-	([Renderer = SharedThis(this), InVDBBuilder](
-		 FRHICommandListImmediate& RHICmdList) { Renderer->VDBBuilder = InVDBBuilder; });
+	([Renderer = SharedThis(this), InVDB](FRHICommandListImmediate& RHICmdList) { Renderer->VDB = InVDB; });
 }
 
 void FVolRendererVDBRenderer::SetTransferFunction(
@@ -237,8 +237,11 @@ void FVolRendererVDBRenderer::SetParameters(const FVolRendererVDBRendererParamet
 
 void FVolRendererVDBRenderer::Render_RenderThread(FPostOpaqueRenderParameters& Params)
 {
-	if (!VDBRenderer || !VDBBuilder)
+	if (!VDBRenderer || !VDB)
 		return;
+
+	if (!Params.View->IsFirstInFamily())
+		return; // Avoid rendering in Material Preview or so on
 
 	auto* GraphBuilder = Params.GraphBuilder;
 	auto& RHICmdList = GraphBuilder->RHICmdList;
@@ -302,13 +305,13 @@ void FVolRendererVDBRenderer::Render_RenderThread(FPostOpaqueRenderParameters& P
 		}
 
 		void* InDepthTextureNative = VDBRendererParams.bUseDepthOcclusion ? DepthTexture->GetNativeResource() : nullptr;
-		void* OutVolumeColorTextureNative = VolumeColorTexture->GetNativeResource();
+		void* InOutVolumeColorTextureNative = VolumeColorTexture->GetNativeResource();
 		if (bNeedRegister)
 		{
 			VolRenderer::FStdOutputLinker Linker;
 			VDBRenderer->Register({ .Device = GDynamicRHI->RHIGetNativeDevice(),
 				.InSceneDepthTexture = InDepthTextureNative,
-				.OutColorTexture = OutVolumeColorTextureNative });
+				.InOutColorTexture = InOutVolumeColorTextureNative });
 		}
 
 		VDBRendererParams.RenderResolution = VolumeRenderResolution;
@@ -384,12 +387,12 @@ void FVolRendererVDBRenderer::Render_RenderThread(FPostOpaqueRenderParameters& P
 										  VDBRendererParams.InvVoxelSpaces.Z)
 					* CameraPositionToLoacl,
 				DepthTexture = DepthTexture, VolumeColorTexture = VolumeColorTexture, VDBRenderer = VDBRenderer.get(),
-				VDBBuilder = VDBBuilder.get()](FRHICommandListImmediate& RHICmdList) {
+				VDB = VDB.get()](FRHICommandListImmediate& RHICmdList) {
 				VolRenderer::FStdOutputLinker Linker;
 				VDBRenderer->Render({ .InverseProjection = InverseProjection,
 					.CameraRotationToLocal = CameraRotationToLoacl,
 					.CameraPositionToVDB = CameraPositionToVDB,
-					.Builder = *VDBBuilder });
+					.VDB = *VDB });
 			});
 	}
 

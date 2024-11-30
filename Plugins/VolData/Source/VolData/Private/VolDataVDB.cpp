@@ -168,7 +168,7 @@ UVolDataVDBComponent::UVolDataVDBComponent(const FObjectInitializer&)
 	}
 
 	CPUData = MakeShared<FVolDataVDBCPUData>();
-	VDBBuilder = DepthBoxVDB::VolData::IVDBBuilder::Create({});
+	VDB = DepthBoxVDB::VolData::IVDB::Create({});
 }
 
 void UVolDataVDBComponent::LoadRAWVolume()
@@ -408,7 +408,7 @@ void UVolDataVDBComponent::buildVDB(bool bNeedReload, bool bNeedRelayoutAtlas)
 	{
 		AsyncTask(ENamedThreads::Type::ActualRenderingThread, [this]() {
 			VolData::FStdOutputLinker Linker;
-			VDBBuilder->FullBuild({ .RAWVolumeData = CPUData->RAWVolumeData.GetData(),
+			VDB->FullBuild({ .RAWVolumeData = CPUData->RAWVolumeData.GetData(),
 				.EmptyScalarRanges = CPUData->EmptyScalarRanges.GetData(),
 				.EmptyScalarRangeNum = CPUData->EmptyScalarRangeNum,
 				.MaxAllowedGPUMemoryInGB = VDBParams.MaxAllowedGPUMemoryInGB,

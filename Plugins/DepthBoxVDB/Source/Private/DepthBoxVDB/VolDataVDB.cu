@@ -16,10 +16,10 @@
 
 #define ENABLE_CUDA_DEBUG_IN_CPU
 
-std::shared_ptr<DepthBoxVDB::VolData::IVDBBuilder> DepthBoxVDB::VolData::IVDBBuilder::Create(
+std::shared_ptr<DepthBoxVDB::VolData::IVDB> DepthBoxVDB::VolData::IVDB::Create(
 	const CreateParameters& Params)
 {
-	return std::make_shared<VDBBuilder>(Params);
+	return std::make_shared<VDB>(Params);
 }
 
 union BrickSortKey
@@ -46,7 +46,7 @@ union BrickSortKey
 	__host__ __device__ bool operator<(const BrickSortKey& Other) const { return Key < Other.Key; }
 };
 
-DepthBoxVDB::VolData::VDBBuilder::VDBBuilder(const CreateParameters& Params)
+DepthBoxVDB::VolData::VDB::VDB(const CreateParameters& Params)
 {
 	int DeviceNum = 0;
 	CUDA_CHECK(cudaGetDeviceCount(&DeviceNum));
@@ -59,7 +59,7 @@ DepthBoxVDB::VolData::VDBBuilder::VDBBuilder(const CreateParameters& Params)
 	CUDA_CHECK(cudaStreamCreate(&NodeStream));
 }
 
-DepthBoxVDB::VolData::VDBBuilder::~VDBBuilder()
+DepthBoxVDB::VolData::VDB::~VDB()
 {
 	if (dData)
 	{
@@ -111,7 +111,7 @@ template <typename T> void DebugInCPU(const thrust::device_vector<T>& dVector, c
 
 #endif
 
-void DepthBoxVDB::VolData::VDBBuilder::FullBuild(const FullBuildParameters& Params)
+void DepthBoxVDB::VolData::VDB::FullBuild(const FullBuildParameters& Params)
 {
 	CUDA_CHECK(cudaStreamSynchronize(NodeStream));
 
@@ -332,7 +332,7 @@ void DepthBoxVDB::VolData::VDBBuilder::FullBuild(const FullBuildParameters& Para
 	}
 }
 
-void DepthBoxVDB::VolData::VDBBuilder::UpdateDepthBoxAsync(const UpdateDepthBoxParameters& Params)
+void DepthBoxVDB::VolData::VDB::UpdateDepthBoxAsync(const UpdateDepthBoxParameters& Params)
 {
 	if (!AtlasSurface)
 	{
@@ -357,7 +357,7 @@ void DepthBoxVDB::VolData::VDBBuilder::UpdateDepthBoxAsync(const UpdateDepthBoxP
 }
 
 template <typename VoxelType>
-void DepthBoxVDB::VolData::VDBBuilder::updateDepthBoxAsync(const UpdateDepthBoxParameters& Params)
+void DepthBoxVDB::VolData::VDB::updateDepthBoxAsync(const UpdateDepthBoxParameters& Params)
 {
 	uint32_t BrickYxXPerAtlas = BrickPerAtlas.x * BrickPerAtlas.y;
 	uint32_t VoxelYxXPerBrick = VDBParams.ChildPerLevels[0] * VDBParams.ChildPerLevels[0];
@@ -542,14 +542,14 @@ void DepthBoxVDB::VolData::VDBBuilder::updateDepthBoxAsync(const UpdateDepthBoxP
 	thrust::for_each(thrust::cuda::par.on(AtlasStream), thrust::make_counting_iterator(uint32_t(0)),
 		thrust::make_counting_iterator(DepthVoxelNumPerAtlas), UpdateKernel);
 }
-template void DepthBoxVDB::VolData::VDBBuilder::updateDepthBoxAsync<uint8_t>(
+template void DepthBoxVDB::VolData::VDB::updateDepthBoxAsync<uint8_t>(
 	const UpdateDepthBoxParameters& Params);
-template void DepthBoxVDB::VolData::VDBBuilder::updateDepthBoxAsync<uint16_t>(
+template void DepthBoxVDB::VolData::VDB::updateDepthBoxAsync<uint16_t>(
 	const UpdateDepthBoxParameters& Params);
-template void DepthBoxVDB::VolData::VDBBuilder::updateDepthBoxAsync<float>(
+template void DepthBoxVDB::VolData::VDB::updateDepthBoxAsync<float>(
 	const UpdateDepthBoxParameters& Params);
 
-DepthBoxVDB::VolData::VDBData* DepthBoxVDB::VolData::VDBBuilder::GetDeviceData() const
+DepthBoxVDB::VolData::VDBData* DepthBoxVDB::VolData::VDB::GetDeviceData() const
 {
 	if (ValidBrickNum == 0)
 		return nullptr;
@@ -559,7 +559,7 @@ DepthBoxVDB::VolData::VDBData* DepthBoxVDB::VolData::VDBBuilder::GetDeviceData()
 	return dData;
 }
 
-void DepthBoxVDB::VolData::VDBBuilder::relayoutRAWVolume(const FullBuildParameters& Params)
+void DepthBoxVDB::VolData::VDB::relayoutRAWVolume(const FullBuildParameters& Params)
 {
 	uint32_t VoxelYxX = VDBParams.VoxelPerVolume.x * VDBParams.VoxelPerVolume.y;
 	uint32_t VoxelYxXPerAtlasBrick = VDBParams.VoxelPerAtlasBrick * VDBParams.VoxelPerAtlasBrick;
@@ -763,7 +763,7 @@ void DepthBoxVDB::VolData::VDBBuilder::relayoutRAWVolume(const FullBuildParamete
 	CUDA_CHECK(cudaStreamSynchronize(AtlasStream));
 }
 
-bool DepthBoxVDB::VolData::VDBBuilder::resizeAtlas()
+bool DepthBoxVDB::VolData::VDB::resizeAtlas()
 {
 	CoordType NeededVoxelPerAtlas;
 	// Compute NeededVoxelPerAtlas
@@ -824,7 +824,7 @@ bool DepthBoxVDB::VolData::VDBBuilder::resizeAtlas()
 	return true;
 }
 
-void DepthBoxVDB::VolData::VDBBuilder::updateAtlas()
+void DepthBoxVDB::VolData::VDB::updateAtlas()
 {
 	uint32_t BrickYxX = VDBParams.BrickPerVolume.x * VDBParams.BrickPerVolume.y;
 	uint32_t VoxelNumPerAtlasBrick = static_cast<uint32_t>(VDBParams.VoxelPerAtlasBrick)

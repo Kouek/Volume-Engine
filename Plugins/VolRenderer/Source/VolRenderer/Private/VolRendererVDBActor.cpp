@@ -100,7 +100,7 @@ void AVolRendererVDBActor::setupRenderer()
 		VDBRenderer->SetParameters(VDBRendererParams);
 	}
 
-	VDBRenderer->SetVDBBuilder(VDBComponent->GetVDBBuilder());
+	VDBRenderer->SetVDB(VDBComponent->GetVDB());
 }
 
 void AVolRendererVDBActor::clearRenderer()

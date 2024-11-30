@@ -19,6 +19,8 @@ namespace DepthBoxVDB
 		using CoordValueType = int32_t;
 		using CoordType = glm::vec<3, CoordValueType>;
 
+		using CoordWithFrameType = glm::vec<4, CoordValueType>;
+
 		static constexpr CoordValueType kInvalidCoordValue =
 			std::numeric_limits<CoordValueType>::max();
 
@@ -62,6 +64,12 @@ namespace DepthBoxVDB
 			}
 		}
 
+		struct CUDA_ALIGN RAWVolumeParameters
+		{
+			EVoxelType VoxelType;
+			CoordType  VoxelPerVolume;
+		};
+
 		struct CUDA_ALIGN VDBParameters
 		{
 			static constexpr int32_t kMaxLevelNum = 3;
@@ -79,18 +87,18 @@ namespace DepthBoxVDB
 			CoordType  BrickPerVolume;
 		};
 
-		class IVDBBuilder : Noncopyable
+		class IVDB : Noncopyable
 		{
 		public:
 			struct CreateParameters
 			{
 			};
-			static std::shared_ptr<IVDBBuilder> Create(const CreateParameters& Params);
-			virtual ~IVDBBuilder() {}
+			static std::shared_ptr<IVDB> Create(const CreateParameters& Params);
+			virtual ~IVDB() {}
 
 			struct FullBuildParameters
 			{
-				uint8_t*		 RAWVolumeData;
+				const uint8_t*	 RAWVolumeData;
 				const glm::vec2* EmptyScalarRanges;
 				uint32_t		 EmptyScalarRangeNum;
 				uint32_t		 MaxAllowedGPUMemoryInGB;

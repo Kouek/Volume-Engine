@@ -83,20 +83,20 @@ namespace DepthBoxVDB
 			}
 		};
 
-		class VDBBuilder : public IVDBBuilder
+		class VDB : public IVDB
 		{
 		public:
-			VDBBuilder(const CreateParameters& Params);
-			~VDBBuilder();
+			VDB(const CreateParameters& Params);
+			~VDB();
 
 			void FullBuild(const FullBuildParameters& Params) override;
 			void UpdateDepthBoxAsync(const UpdateDepthBoxParameters& Params) override;
-			template <typename VoxelType>
-			void updateDepthBoxAsync(const UpdateDepthBoxParameters& Params);
 
 			VDBData* GetDeviceData() const;
 
 			// Declare Private functions in Public scope to use CUDA Lambda
+			template <typename VoxelType>
+			void updateDepthBoxAsync(const UpdateDepthBoxParameters& Params);
 			void relayoutRAWVolume(const FullBuildParameters& Params);
 			bool resizeAtlas();
 			void updateAtlas();
@@ -123,8 +123,9 @@ namespace DepthBoxVDB
 
 			VDBData* dData = nullptr;
 
-			std::array<thrust::device_vector<VDBNode>, VDBParameters::kMaxLevelNum>	dNodePerLevels;
-			std::array<thrust::device_vector<uint32_t>, VDBParameters::kMaxLevelNum> dChildPerLevels;
+			std::array<thrust::device_vector<VDBNode>, VDBParameters::kMaxLevelNum> dNodePerLevels;
+			std::array<thrust::device_vector<uint32_t>, VDBParameters::kMaxLevelNum>
+				dChildPerLevels;
 
 			friend class VolRenderer::VDBRenderer;
 		};

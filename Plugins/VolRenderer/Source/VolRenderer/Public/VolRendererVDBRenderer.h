@@ -23,7 +23,8 @@ namespace DepthBoxVDB
 					return ERHIType::D3D12;
 			}
 
-			return ERHIType::None;
+			check(false);
+			return ERHIType::D3D12;
 		}
 
 	} // namespace VolRenderer
@@ -58,7 +59,8 @@ struct FVolRendererVDBRendererParameters
 	UPROPERTY(EditAnywhere)
 	bool bUseDepthOcclusion = true;
 	UPROPERTY(EditAnywhere)
-	bool bHighlightDeformRegion = false;
+	bool bClipByVisibleBox = false;
+	bool bRenderDeformVolume = false;
 	UPROPERTY(EditAnywhere)
 	int32 RenderResolutionLOD = 1;
 	UPROPERTY(EditAnywhere)
@@ -75,6 +77,7 @@ struct FVolRendererVDBRendererParameters
 	FVector VisibleBoxMinPositionToLocal = FVector::OneVector;
 	UPROPERTY(VisibleAnywhere)
 	FVector VisibleBoxMaxPositionToLocal = FVector::ZeroVector;
+	FVector DeformVolumeOrigin = FVector::ZeroVector;
 
 	FTransform Transform;
 
@@ -86,7 +89,7 @@ struct FVolRendererVDBRendererParameters
 
 	TOptional<FString> InitializeAndCheck();
 
-	operator DepthBoxVDB::VolRenderer::VDBRendererParameters();
+	operator DepthBoxVDB::VolRenderer::IVDBRenderer::RendererParameters();
 };
 
 class VOLRENDERER_API FVolRendererVDBRenderer : public TSharedFromThis<FVolRendererVDBRenderer>
@@ -99,7 +102,7 @@ public:
 
 	void Register();
 	void Unregister();
-	void SetVDBBuilder(std::shared_ptr<DepthBoxVDB::VolData::IVDBBuilder> InVDBBuilder);
+	void SetVDB(std::shared_ptr<DepthBoxVDB::VolData::IVDB> InVDB);
 	void SetTransferFunction(
 		const TArray<float>& InTransferFunctionData, const TArray<float>& InTransferFunctionDataPreIntegrated);
 	void SetParameters(const FVolRendererVDBRendererParameters& Params);
@@ -120,7 +123,7 @@ private:
 	TArray<float> TransferFunctionData;
 	TArray<float> TransferFunctionDataPreIntegrated;
 
-	std::shared_ptr<DepthBoxVDB::VolData::IVDBBuilder>		VDBBuilder;
+	std::shared_ptr<DepthBoxVDB::VolData::IVDB>				VDB;
 	std::unique_ptr<DepthBoxVDB::VolRenderer::IVDBRenderer> VDBRenderer;
 
 	FVolRendererVDBRendererParameters VDBRendererParams;

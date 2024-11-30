@@ -14,9 +14,9 @@ class VOLRENDERER_API AVolRendererVDBActor : public AActor
 	GENERATED_BODY()
 
 public:
-	UPROPERTY(EditAnywhere, Category = "VolRenderer", DisplayName = "VDB Renderer")
+	UPROPERTY(EditAnywhere, Category = "VolRenderer", DisplayName = "VDB Renderer Parameters")
 	FVolRendererVDBRendererParameters VDBRendererParams;
-	UPROPERTY(VisibleAnywhere, Category = "VolRenderer")
+	UPROPERTY(VisibleAnywhere, Category = "VolRenderer", DisplayName = "VDB")
 	TObjectPtr<UVolDataVDBComponent> VDBComponent;
 
 	UPROPERTY(EditAnywhere, Category = "VolDeform")

@@ -13,12 +13,11 @@ namespace DepthBoxVDB
 
 		enum class ERHIType
 		{
-			None = 0,
-			D3D12,
+			D3D12 = 0,
 			MAX
 		};
 
-		enum ERenderTarget
+		enum EVDBRenderTarget
 		{
 			Scene = 0,
 			AABB0,
@@ -29,41 +28,39 @@ namespace DepthBoxVDB
 			MAX
 		};
 
-		struct CUDA_ALIGN VDBRendererParameters
+		struct RendererParameters
 		{
-			ERenderTarget RenderTarget;
-			int32_t		  MaxStepNum;
-			bool		  bUseDepthBox;
-			bool		  bUsePreIntegratedTF;
-			bool		  bUseDepthOcclusion;
-			float		  Step;
-			float		  MaxStepDist;
-			float		  MaxAlpha;
-			glm::vec3	  InvVoxelSpaces;
-			glm::vec3	  VisibleAABBMinPosition;
-			glm::vec3	  VisibleAABBMaxPosition;
+			int32_t	  MaxStepNum;
+			bool	  bUsePreIntegratedTF;
+			bool	  bUseDepthOcclusion;
+			float	  Step;
+			float	  MaxStepDist;
+			float	  MaxAlpha;
+			glm::vec3 InvVoxelSpaces;
 		};
 
-		class IVDBRenderer : Noncopyable
+		struct RAWRendererParameters : RendererParameters
+		{
+			bool bUsePreIntegratedTF;
+			bool bUseDepthOcclusion;
+		};
+
+		class IRenderer : Noncopyable
 		{
 		public:
 			struct CreateParameters
 			{
 				ERHIType RHIType;
 			};
-			static std::unique_ptr<IVDBRenderer> Create(const CreateParameters& Params);
-			virtual ~IVDBRenderer() {}
 
 			struct RegisterParameters
 			{
 				void* Device;
 				void* InSceneDepthTexture;
-				void* OutColorTexture;
+				void* InOutColorTexture;
 			};
 			virtual void Register(const RegisterParameters& Params) = 0;
 			virtual void Unregister() = 0;
-
-			virtual void SetParameters(const VDBRendererParameters& Params) = 0;
 
 			struct TransferFunctionParameters
 			{
@@ -72,13 +69,32 @@ namespace DepthBoxVDB
 				uint32_t	 Resolution;
 			};
 			virtual void SetTransferFunction(const TransferFunctionParameters& Params) = 0;
+		};
+
+		class IVDBRenderer : virtual public IRenderer
+		{
+		public:
+			struct CreateParameters : IRenderer::CreateParameters
+			{
+			};
+			static std::unique_ptr<IVDBRenderer> Create(const CreateParameters& Params);
+			virtual ~IVDBRenderer() {}
+
+			struct RendererParameters : VolRenderer::RendererParameters
+			{
+				EVDBRenderTarget RenderTarget;
+				bool			 bUseDepthBox;
+				glm::vec3		 VisibleAABBMinPosition;
+				glm::vec3		 VisibleAABBMaxPosition;
+			};
+			virtual void SetParameters(const RendererParameters& Params) = 0;
 
 			struct RenderParameters
 			{
-				glm::mat4					InverseProjection;
-				glm::mat3					CameraRotationToLocal;
-				glm::vec3					CameraPositionToVDB;
-				const VolData::IVDBBuilder& Builder;
+				glm::mat4			 InverseProjection;
+				glm::mat3			 CameraRotationToLocal;
+				glm::vec3			 CameraPositionToVDB;
+				const VolData::IVDB& VDB;
 			};
 			virtual void Render(const RenderParameters& Params) = 0;
 		};

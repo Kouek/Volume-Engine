@@ -26,11 +26,15 @@ add_definitions("-DNOMINMAX")
 # <lib>
 # <DepthBoxVDB>
 set(TARGET_NAME "DepthBoxVDB")
+file(
+	GLOB
+	CUDA_SRCS
+	"${CMAKE_CURRENT_LIST_DIR}/Source/Private/${TARGET_NAME}/*.cu"
+)
 add_library(
 	${TARGET_NAME}
 	STATIC
-	"${CMAKE_CURRENT_LIST_DIR}/Source/Private/${TARGET_NAME}/VolData.cu"
-	"${CMAKE_CURRENT_LIST_DIR}/Source/Private/${TARGET_NAME}/VolRenderer.cu"
+	${CUDA_SRCS}
 )
 set(LIBS "glm::glm")
 target_link_libraries(
