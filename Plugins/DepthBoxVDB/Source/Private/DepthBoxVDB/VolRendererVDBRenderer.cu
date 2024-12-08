@@ -250,7 +250,7 @@ __device__ static glm::vec4 RayCastVDB(const DepthBoxVDB::VolData::VDBData& VDBD
 				break;
 
 			Hdda3d.Prepare(Stack.Level == VDBParams.RootLevel
-					? VolData::CoordType(0)
+					? CoordType(0)
 					: Stack.TopNode().Coord * VDBParams.ChildCoverVoxelPerLevels[Stack.Level + 1],
 				VDBParams.ChildCoverVoxelPerLevels[Stack.Level]);
 		}
@@ -259,7 +259,7 @@ __device__ static glm::vec4 RayCastVDB(const DepthBoxVDB::VolData::VDBData& VDBD
 
 template <typename VoxelType>
 __device__ bool DepthSkip(const glm::vec3& PosInBrick,
-	const DepthBoxVDB::VolData::CoordType& MinCoordInAtlasBrick, LeafEnteredParameters& Params,
+	const DepthBoxVDB::CoordType& MinCoordInAtlasBrick, LeafEnteredParameters& Params,
 	const DepthBoxVDB::VolData::VDBData& VDBData, const DepthBoxVDB::Ray& EyeRay)
 {
 	using namespace DepthBoxVDB;
@@ -322,8 +322,7 @@ __device__ static glm::vec4 RenderScene(cudaTextureObject_t				   TransferFuncti
 			Params.tEnter = RendererParams.Step * glm::ceil(Params.tEnter / RendererParams.Step);
 			glm::vec3	MinPosInBrick = glm::vec3(Params.Node.Coord * VDBParams.ChildPerLevels[0]);
 			glm::vec3	PosInBrick = EyeRay.Origin + Params.tEnter * EyeRay.Direction - MinPosInBrick;
-			VolData::CoordType MinCoordInAtlasBrick =
-				Params.Node.CoordInAtlas * VDBParams.VoxelPerAtlasBrick
+			CoordType	MinCoordInAtlasBrick = Params.Node.CoordInAtlas * VDBParams.VoxelPerAtlasBrick
 				+ VDBParams.ApronAndDepthWidth;
 
 			if constexpr (bUseDepthBox)
@@ -468,8 +467,7 @@ __device__ static glm::vec4 RenderDepthBox(
 			Params.tEnter = RendererParams.Step * glm::ceil(Params.tEnter / RendererParams.Step);
 			glm::vec3	MinPosInBrick = glm::vec3(Params.Node.Coord * VDBParams.ChildPerLevels[0]);
 			glm::vec3	PosInBrick = EyeRay.Origin + Params.tEnter * EyeRay.Direction - MinPosInBrick;
-			VolData::CoordType MinCoordInAtlasBrick =
-				Params.Node.CoordInAtlas * VDBParams.VoxelPerAtlasBrick
+			CoordType	MinCoordInAtlasBrick = Params.Node.CoordInAtlas * VDBParams.VoxelPerAtlasBrick
 				+ VDBParams.ApronAndDepthWidth;
 
 			Alpha = 1.f;
@@ -554,14 +552,11 @@ void DepthBoxVDB::VolRenderer::VDBRenderer::Render(const RenderParameters& Param
 	}
 
 	const VolData::VDB&		VDB = static_cast<const VolData::VDB&>(Params.VDB);
-	const VolData::VDBData* dVDBData = VDB.GetDeviceData();
+	const VolData::VDBData* dVDBData = VDB.GetDeviceVDBData();
 	if (!dVDBData)
-	{
-		std::cerr << "Empty Device Data\n";
 		return;
-	}
 
-	const VolData::VDBParameters& VDBParams = VDB.VDBParams;
+	const VolData::VDBParameters& VDBParams = VDB.GetVDBParameters();
 
 	auto DispatchRender = [&]<typename VoxelType>(VoxelType*) {
 		if (bUseDepthBox && bUsePreIntegratedTF)
@@ -576,13 +571,13 @@ void DepthBoxVDB::VolRenderer::VDBRenderer::Render(const RenderParameters& Param
 
 	switch (VDBParams.VoxelType)
 	{
-		case VolData::EVoxelType::UInt8:
+		case EVoxelType::UInt8:
 			DispatchRender((uint8_t*)nullptr);
 			break;
-		case VolData::EVoxelType::UInt16:
+		case EVoxelType::UInt16:
 			DispatchRender((uint16_t*)nullptr);
 			break;
-		case VolData::EVoxelType::Float32:
+		case EVoxelType::Float32:
 			DispatchRender((float*)nullptr);
 			break;
 	}

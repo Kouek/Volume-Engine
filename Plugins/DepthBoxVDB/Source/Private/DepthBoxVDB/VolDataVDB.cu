@@ -14,7 +14,8 @@
 
 #include <CUDA/Algorithm.h>
 
-#define ENABLE_CUDA_DEBUG_IN_CPU
+// NDEBUG is set when build type is RelWithDbg, thus we define a new macro to Debug
+#define DEPTHBOX_DEBUG
 
 std::shared_ptr<DepthBoxVDB::VolData::IVDB> DepthBoxVDB::VolData::IVDB::Create(
 	const CreateParameters& Params)
@@ -22,54 +23,37 @@ std::shared_ptr<DepthBoxVDB::VolData::IVDB> DepthBoxVDB::VolData::IVDB::Create(
 	return std::make_shared<VDB>(Params);
 }
 
-union BrickSortKey
-{
-	uint64_t Key;
-	struct
-	{
-		uint64_t Z : 20;
-		uint64_t Y : 20;
-		uint64_t X : 20;
-		uint64_t Level : 4;
-	} LevelPosition;
-
-	__host__ constexpr static BrickSortKey Invalid()
-	{
-		BrickSortKey Ret{ std::numeric_limits<uint64_t>::max() };
-		return Ret;
-	}
-
-	__host__ __device__ bool operator==(const BrickSortKey& Other) const
-	{
-		return Key == Other.Key;
-	}
-	__host__ __device__ bool operator<(const BrickSortKey& Other) const { return Key < Other.Key; }
-};
-
 DepthBoxVDB::VolData::VDB::VDB(const CreateParameters& Params)
 {
 	int DeviceNum = 0;
 	CUDA_CHECK(cudaGetDeviceCount(&DeviceNum));
-	assert(DeviceNum > 0);
+	if (DeviceNum == 0)
+	{
+		std::cerr << "No CUDA Device found.";
+	}
 
 	cudaDeviceProp Prop;
 	CUDA_CHECK(cudaGetDeviceProperties(&Prop, 0));
 
-	CUDA_CHECK(cudaStreamCreate(&AtlasStream));
-	CUDA_CHECK(cudaStreamCreate(&NodeStream));
+	for (uint32_t i = 0; i < static_cast<uint32_t>(EStream::Max); ++i)
+	{
+		CUDA_CHECK(cudaStreamCreateWithFlags(&Streams[i], cudaStreamNonBlocking));
+	}
 }
 
 DepthBoxVDB::VolData::VDB::~VDB()
 {
-	if (dData)
+	for (uint32_t i = 0; i < static_cast<uint32_t>(EStream::Max); ++i)
 	{
-		CUDA_CHECK(cudaFree(dData));
+		CUDA_CHECK(cudaStreamDestroy(Streams[i]));
 	}
 }
 
-#ifdef ENABLE_CUDA_DEBUG_IN_CPU
+#ifdef DEPTHBOX_DEBUG
 template <typename T> void DebugInCPU(const thrust::device_vector<T>& dVector, const char* Name)
 {
+	using namespace DepthBoxVDB::VolData;
+
 	thrust::host_vector<T> hVetcor = dVector;
 	std ::string		   DebugMsg = std::format("CUDA Debug {}:\n\t", Name);
 	uint32_t			   Index = 0;
@@ -113,251 +97,535 @@ template <typename T> void DebugInCPU(const thrust::device_vector<T>& dVector, c
 
 void DepthBoxVDB::VolData::VDB::FullBuild(const FullBuildParameters& Params)
 {
-	CUDA_CHECK(cudaStreamSynchronize(NodeStream));
+	StartAppendFrame({ .EmptyScalarRanges = Params.EmptyScalarRanges,
+		.EmptyScalarRangeNum = Params.EmptyScalarRangeNum,
+		.MaxAllowedGPUMemoryInGB = Params.MaxAllowedGPUMemoryInGB,
+		.MaxAllowedResidentFrameNum = Params.MaxAllowedResidentFrameNum,
+		.VDBParams = Params.VDBParams });
+	AppendFrame({ .RAWVolumeData = Params.RAWVolumeData });
+	EndAppendFrame();
+}
 
+void DepthBoxVDB::VolData::VDB::StartAppendFrame(const StartAppendFrameParameters& Params)
+{
 	VDBParams = Params.VDBParams;
-	MaxAllowedGPUMemoryInGB = Params.MaxAllowedGPUMemoryInGB;
+	MaxAllowedGPUMemoryInByte = static_cast<size_t>(Params.MaxAllowedGPUMemoryInGB * (1 << 30));
+	MaxAllowedResidentFrameNum = Params.MaxAllowedResidentFrameNum;
 
-	// Update Atlas
-	relayoutRAWVolume(Params);
-	if (ValidBrickNum == 0)
+	EmptyScalarRanges.resize(Params.EmptyScalarRangeNum);
+	for (uint32_t RngIdx = 0; RngIdx < Params.EmptyScalarRangeNum; ++RngIdx)
 	{
-		std::cout << "No valid bricks.\n";
+		EmptyScalarRanges[RngIdx] = Params.EmptyScalarRanges[RngIdx];
+	}
+	EmptyScalarRangesReactive = EmptyScalarRanges;
+	dEmptyScalarRanges.resize(EmptyScalarRanges.size());
+	CUDA_CHECK(cudaMemcpyAsync(thrust::raw_pointer_cast(dEmptyScalarRanges.data()),
+		EmptyScalarRanges.data(), sizeof(glm::vec2) * EmptyScalarRanges.size(),
+		cudaMemcpyHostToDevice, getStream(EStream::Copy)));
+
+	dVDBDataCurrentFrame = nullptr;
+	ResidentFrameNum = 0;
+	ResidentIndices.clear();
+}
+
+void DepthBoxVDB::VolData::VDB::AppendFrame(const AppendFrameParameters& Params)
+{
+	uint32_t FrameIndex = GetFrameNum();
+	generateDataPerFrame(Params.RAWVolumeData, FrameIndex);
+}
+
+void DepthBoxVDB::VolData::VDB::EndAppendFrame()
+{
+	if (!allocateResource())
 		return;
+
+	SwitchToFrame(0);
+}
+
+void Popup(void* Params)
+{
+	auto& PopupParams = *(DepthBoxVDB::VolData::VDB::PopupFrameParameters*)Params;
+	*PopupParams.Dst = *PopupParams.Src;
+}
+
+void DepthBoxVDB::VolData::VDB::SwitchToFrame(uint32_t FrameIndex)
+{
+	uint32_t BrickNum = static_cast<uint32_t>(VDBParams.BrickPerVolume.z)
+		* VDBParams.BrickPerVolume.y * VDBParams.BrickPerVolume.x;
+
+	ResidentDataPerFrames.resize(MaxResidentFrameNum);
+
+	// Recycle and back to Atlas
+	while (!ResidentIndices.empty() &&
+		[&]() { return ResidentDataPerFrames[ResidentIndices.front()].FrameIndex != FrameIndex; }())
+	{
+		uint32_t ResidentIndex = ResidentIndices.front();
+		ResidentIndices.pop_front();
+		auto& RsdDataPF = ResidentDataPerFrames[ResidentIndex];
+
+		for (auto [BrickIndexWithFrame, AtlasBrickIndex] : RsdDataPF.BrickWithFrameToAtlasBrick)
+		{
+			BrickWithFrameToAtlasBrick[BrickIndexWithFrame] = kInvalidIndex;
+			AtlasBrickToBrickWithFrame[AtlasBrickIndex] = kInvalidIndex;
+			AvailableAtlasBrick.emplace_back(AtlasBrickIndex);
+		}
+		RsdDataPF.Invalidate();
+
+		--ResidentFrameNum;
+		std::swap(ResidentDataPerFrames[ResidentFrameNum], ResidentDataPerFrames[ResidentIndex]);
 	}
 
-	UpdateDepthBoxAsync({ .EmptyScalarRanges = Params.EmptyScalarRanges,
-		.EmptyScalarRangeNum = Params.EmptyScalarRangeNum });
-
-	uint32_t BrickYxX = VDBParams.BrickPerVolume.x * VDBParams.BrickPerVolume.y;
-
-	// 1. Assign Brick Sort Keys to non-empty Brick
-	// 2. Sort Brick Sort Keys
-	thrust::device_vector<BrickSortKey> dBrickSortKeys(
-		(VDBParams.RootLevel + 1) * ValidBrickNum, BrickSortKey::Invalid());
+	// Allocate from Atlas and perform Transfer and Compuatation
 	{
-		auto AssignBrickKeysKernel =
-			[BrickSortKeys = thrust::raw_pointer_cast(dBrickSortKeys.data()),
-				AtlasBrickToBrick = thrust::raw_pointer_cast(dAtlasBrickToBrick.data()), BrickYxX,
-				ValidBrickNum = ValidBrickNum,
-				VDBParams = VDBParams] __device__(uint32_t AtlasBrickIndex) {
-				CoordType BrickCoord = AtlasBrickToBrick[AtlasBrickIndex];
+		uint32_t FrameNum = GetFrameNum();
+		uint32_t NewNeededFrameIndex = ResidentIndices.empty()
+			? FrameIndex
+			: (ResidentDataPerFrames[ResidentIndices.back()].FrameIndex + 1) % FrameNum;
+		uint32_t NewNeededNum = MaxResidentFrameNum - ResidentIndices.size();
+		for (uint32_t NewNeededIndex = 0; NewNeededIndex < NewNeededNum; ++NewNeededIndex)
+		{
+			uint32_t ResidentIndex = ResidentFrameNum;
+			++ResidentFrameNum;
+			ResidentIndices.emplace_back(ResidentIndex);
 
-				BrickSortKey Key;
-				Key.LevelPosition.Level = 0;
-				Key.LevelPosition.X = BrickCoord.x;
-				Key.LevelPosition.Y = BrickCoord.y;
-				Key.LevelPosition.Z = BrickCoord.z;
-				uint32_t FlatIdx = AtlasBrickIndex;
-				BrickSortKeys[FlatIdx] = Key;
+			auto& RsdDataPF = ResidentDataPerFrames[ResidentIndex];
+			RsdDataPF.FrameIndex = NewNeededFrameIndex;
+			NewNeededFrameIndex = (NewNeededFrameIndex + 1) % FrameNum;
 
-				for (int32_t Lev = 1; Lev <= VDBParams.RootLevel; ++Lev)
+			auto& DataPF = DataPerFrames[RsdDataPF.FrameIndex];
+			for (uint32_t BSKIndex = 0; BSKIndex < DataPF.BrickSortKeys.size(); ++BSKIndex)
+			{
+#ifdef DEPTHBOX_DEBUG
+				if (AvailableAtlasBrick.empty())
 				{
-					Key.LevelPosition.Level = Lev;
-					Key.LevelPosition.X /= VDBParams.ChildPerLevels[Lev];
-					Key.LevelPosition.Y /= VDBParams.ChildPerLevels[Lev];
-					Key.LevelPosition.Z /= VDBParams.ChildPerLevels[Lev];
-
-					FlatIdx = Lev * ValidBrickNum + AtlasBrickIndex;
-					BrickSortKeys[FlatIdx] = Key;
+					throw std::exception("Algorithm Error!");
 				}
-			};
-
-		thrust::for_each(thrust::cuda::par.on(NodeStream),
-			thrust::make_counting_iterator(uint32_t(0)),
-			thrust::make_counting_iterator(ValidBrickNum), AssignBrickKeysKernel);
-
-		thrust::sort(
-			thrust::cuda::par.on(NodeStream), dBrickSortKeys.begin(), dBrickSortKeys.end());
-
-#ifdef ENABLE_CUDA_DEBUG_IN_CPU
-		CUDA_CHECK(cudaStreamSynchronize(NodeStream));
-		CUDA_DEBUG_IN_CPU(dBrickSortKeys);
 #endif
-	}
+				uint32_t BrickIndexWithFrame = [&]() {
+					BrickSortKey	   BSKey = DataPF.BrickSortKeys[BSKIndex];
+					CoordWithFrameType BrickCoordWithFrame;
+					BrickCoordWithFrame.x = BSKey.LevelPosition.X;
+					BrickCoordWithFrame.y = BSKey.LevelPosition.Y;
+					BrickCoordWithFrame.z = BSKey.LevelPosition.Z;
+					BrickCoordWithFrame.w = RsdDataPF.FrameIndex;
 
-	// Compact Brick Sort Keys
-	{
-		auto dDiffs = CUDA::Difference<uint32_t>(dBrickSortKeys, 0, NodeStream);
-		dBrickSortKeys = CUDA::Compact(dBrickSortKeys, dDiffs, uint32_t(0), NodeStream);
+					return BrickCoordToIndex(BrickCoordWithFrame);
+				}();
 
-#ifdef ENABLE_CUDA_DEBUG_IN_CPU
-		CUDA_CHECK(cudaStreamSynchronize(NodeStream));
-		CUDA_DEBUG_IN_CPU(dBrickSortKeys);
-#endif
-	}
+				uint32_t AtlasBrickIndex = AvailableAtlasBrick.back();
+				AvailableAtlasBrick.pop_back();
 
-	// Allocate Node and Child Pools
-	{
-		uint32_t StartCurrLev = 0;
-		for (int32_t Lev = 0; Lev <= VDBParams.RootLevel; ++Lev)
-		{
-			uint32_t NumCurrLev = Lev == VDBParams.RootLevel ? 1 : [&]() {
-				BrickSortKey KeyNextLev;
-				KeyNextLev.LevelPosition.Level = Lev + 1;
-				KeyNextLev.LevelPosition.X = KeyNextLev.LevelPosition.Y =
-					KeyNextLev.LevelPosition.Z = 0;
-
-				auto ItrCurrLev = dBrickSortKeys.begin() + StartCurrLev;
-				auto ItrNextLev = thrust::lower_bound(
-					thrust::cuda::par.on(NodeStream), ItrCurrLev, dBrickSortKeys.end(), KeyNextLev);
-
-				return thrust::distance(ItrCurrLev, ItrNextLev);
-			}();
-			StartCurrLev += NumCurrLev;
-
-			dNodePerLevels[Lev].assign(NumCurrLev, VDBNode::CreateInvalid());
-
-			if (Lev > 0)
-			{
-				uint64_t ChildCurrLev = VDBParams.ChildPerLevels[Lev];
-				dChildPerLevels[Lev - 1].assign(
-					dNodePerLevels[Lev].size() * ChildCurrLev * ChildCurrLev * ChildCurrLev,
-					VDBData::kInvalidChild);
+				RsdDataPF.BrickWithFrameToAtlasBrick.emplace(BrickIndexWithFrame, AtlasBrickIndex);
+				BrickWithFrameToAtlasBrick[BrickIndexWithFrame] = AtlasBrickIndex;
+				AtlasBrickToBrickWithFrame[AtlasBrickIndex] = BrickIndexWithFrame;
 			}
+
+			transferBrickDataToAtlas(ResidentIndex);
+			updateDepthBox(ResidentIndex);
+			transferBrickDataToCPU(ResidentIndex);
+			buildVDB(ResidentIndex);
 		}
 	}
 
-	// Upload
-	VDBData Data;
-	Data.VDBParams = VDBParams;
-	Data.AtlasTexture = AtlasTexture->Get();
-	Data.AtlasSurface = AtlasSurface->Get();
-	for (int32_t Lev = 0; Lev <= VDBParams.RootLevel; ++Lev)
+	// Popup the Device VDB Data if it is ready
+	if (ResidentFrameNum > 0)
 	{
-		Data.NodePerLevels[Lev] = thrust::raw_pointer_cast(dNodePerLevels[Lev].data());
-		if (Lev > 0)
-		{
-			Data.ChildPerLevels[Lev - 1] =
-				thrust::raw_pointer_cast(dChildPerLevels[Lev - 1].data());
-		}
+		auto& RsdDataPF = ResidentDataPerFrames[ResidentIndices.front()];
+		RsdDataPF.Wait(getStream(EStream::Host), ResidentDataPerFrame::EEvent::BuildVDB);
+
+		PopupFrameParams.Src = &RsdDataPF.dVDBData;
+		PopupFrameParams.Dst = &dVDBDataCurrentFrame;
+		CUDA_CHECK(cudaLaunchHostFunc(getStream(EStream::Host), Popup, &PopupFrameParams));
 	}
-	if (!dData)
+	else
 	{
-		CUDA_CHECK(cudaMalloc(&dData, sizeof(VDBData)));
-	}
-	CUDA_CHECK(cudaMemcpy(dData, &Data, sizeof(VDBData), cudaMemcpyHostToDevice));
-
-	// Assign Node and Child Pools
-	{
-		auto AssignNodePoolsKernel = [BrickYxX, Data = dData,
-										 BrickToAtlasBrick =
-											 thrust::raw_pointer_cast(dBrickToAtlasBrick.data()),
-										 BrickSortKeys = thrust::raw_pointer_cast(
-											 dBrickSortKeys.data())] __device__(int32_t Level,
-										 uint64_t NodeIndexStart, uint32_t NodeIndex) {
-			auto& VDBParams = Data->VDBParams;
-
-			VDBNode		 Node;
-			BrickSortKey SortKey = BrickSortKeys[NodeIndexStart + NodeIndex];
-			Node.Coord = CoordType(
-				SortKey.LevelPosition.X, SortKey.LevelPosition.Y, SortKey.LevelPosition.Z);
-
-			if (Level == 0)
-			{
-				uint32_t BrickIndex = Node.Coord.z * BrickYxX
-					+ Node.Coord.y * VDBParams.BrickPerVolume.x + Node.Coord.x;
-				Node.CoordInAtlas = BrickToAtlasBrick[BrickIndex];
-			}
-			else
-			{
-				int32_t ChildCurrLev = VDBParams.ChildPerLevels[Level];
-				Node.ChildListOffset =
-					static_cast<uint64_t>(NodeIndex) * ChildCurrLev * ChildCurrLev * ChildCurrLev;
-			}
-
-			Data->Node(Level, NodeIndex) = Node;
-		};
-
-		uint64_t NodeIndexStart = 0;
-		for (int32_t Lev = 0; Lev < VDBParams.RootLevel; ++Lev)
-		{
-			thrust::for_each(thrust::cuda::par.on(NodeStream),
-				thrust::make_counting_iterator(uint32_t(0)),
-				thrust::make_counting_iterator(static_cast<uint32_t>(dNodePerLevels[Lev].size())),
-				[Lev, NodeIndexStart, AssignNodePoolsKernel] __device__(
-					uint32_t NodeIndex) { AssignNodePoolsKernel(Lev, NodeIndexStart, NodeIndex); });
-			NodeIndexStart += dNodePerLevels[Lev].size();
-		}
-		{
-			VDBNode Root = VDBNode::CreateInvalid();
-			Root.Coord = CoordType(0, 0, 0);
-			Root.ChildListOffset = 0;
-			dNodePerLevels[VDBParams.RootLevel][0] = Root;
-		}
-
-		auto AssignChildPoolsKernel = [BrickYxX, Data = dData] __device__(
-										  int32_t Level, uint32_t NodeIndex) {
-			auto&	  VDBParams = Data->VDBParams;
-			CoordType Coord = Data->Node(Level, NodeIndex).Coord;
-
-			int32_t	  ParentLevel = VDBParams.RootLevel;
-			VDBNode	  Parent = Data->Node(ParentLevel, 0);
-			CoordType ChildCoordInParent = Data->MapCoord(ParentLevel - 1, Level, Coord);
-			uint32_t ChildIndexInParent = Data->ChildIndexInParent(ParentLevel, ChildCoordInParent);
-			while (ParentLevel != Level + 1)
-			{
-				Parent = Data->Node(
-					ParentLevel - 1, Data->Child(ParentLevel, ChildIndexInParent, Parent));
-				--ParentLevel;
-				ChildCoordInParent = Data->MapCoord(ParentLevel - 1, Level, Coord)
-					- Parent.Coord * VDBParams.ChildPerLevels[ParentLevel];
-				ChildIndexInParent = Data->ChildIndexInParent(ParentLevel, ChildCoordInParent);
-			}
-
-			Data->Child(ParentLevel, ChildIndexInParent, Parent) = NodeIndex;
-		};
-
-		for (int32_t Lev = VDBParams.RootLevel - 1; Lev >= 0; --Lev)
-		{
-			thrust::for_each(thrust::cuda::par.on(NodeStream),
-				thrust::make_counting_iterator(uint32_t(0)),
-				thrust::make_counting_iterator(static_cast<uint32_t>(dNodePerLevels[Lev].size())),
-				[Lev, AssignChildPoolsKernel] __device__(
-					uint32_t NodeIndex) { AssignChildPoolsKernel(Lev, NodeIndex); });
-		}
-
-#ifdef ENABLE_CUDA_DEBUG_IN_CPU
-		CUDA_CHECK(cudaStreamSynchronize(NodeStream));
-		for (int32_t Lev = VDBParams.RootLevel; Lev >= 0; --Lev)
-		{
-			std::cout << std::format("Lev: {}\n", Lev);
-			CUDA_DEBUG_IN_CPU(dNodePerLevels[Lev]);
-			if (Lev > 0)
-			{
-				CUDA_DEBUG_IN_CPU(dChildPerLevels[Lev - 1]);
-			}
-		}
-#endif
+		dVDBDataCurrentFrame = nullptr;
 	}
 }
 
-void DepthBoxVDB::VolData::VDB::UpdateDepthBoxAsync(const UpdateDepthBoxParameters& Params)
+void DepthBoxVDB::VolData::VDB::UpdateDepthBox(const UpdateDepthBoxParameters& Params)
 {
-	if (!AtlasSurface)
+	EmptyScalarRangesReactive.resize(Params.EmptyScalarRangeNum);
+	for (uint32_t RngIdx = 0; RngIdx < Params.EmptyScalarRangeNum; ++RngIdx)
 	{
-		std::cerr << "Invalid Atlas.\n";
-		return;
+		EmptyScalarRangesReactive[RngIdx] = Params.EmptyScalarRanges[RngIdx];
+	}
+	CUDA_CHECK(cudaMemcpyAsync(thrust::raw_pointer_cast(dEmptyScalarRanges.data()),
+		EmptyScalarRangesReactive.data(), sizeof(glm::vec2) * EmptyScalarRangesReactive.size(),
+		cudaMemcpyHostToDevice, getStream(EStream::Copy)));
+
+	for (uint32_t FrameIndex = 0; FrameIndex < GetFrameNum(); ++FrameIndex)
+	{
+		DataPerFrames[FrameIndex].bUpdatedFromEmptyScalarRanges = false;
+	}
+}
+
+void DepthBoxVDB::VolData::VDB::generateDataPerFrame(
+	const uint8_t* RAWVolumeData, uint32_t FrameIndex)
+{
+	uint32_t VoxelYxX = VDBParams.VoxelPerVolume.x * VDBParams.VoxelPerVolume.y;
+	uint32_t VoxelYxXPerAtlasBrick = VDBParams.VoxelPerAtlasBrick * VDBParams.VoxelPerAtlasBrick;
+	uint32_t BrickYxX = VDBParams.BrickPerVolume.x * VDBParams.BrickPerVolume.y;
+	uint32_t BrickNum = BrickYxX * VDBParams.BrickPerVolume.z;
+	uint32_t MaxCoordValInAtlasBrick =
+		VDBParams.ApronAndDepthWidth + VDBParams.ChildPerLevels[0] - 1;
+	uint32_t VoxelNumPerAtlasBrick = VoxelYxXPerAtlasBrick * VDBParams.VoxelPerAtlasBrick;
+	uint32_t VoxelApronOffset = VDBParams.ApronAndDepthWidth - VDBParams.ApronWidth;
+	uint32_t VoxelNumPerBrick = static_cast<uint32_t>(VDBParams.ChildPerLevels[0]);
+	VoxelNumPerBrick = VoxelNumPerBrick * VoxelNumPerBrick * VoxelNumPerBrick;
+
+	std::vector<std::future<void>> Futures(BrickNum);
+
+	if (DataPerFrames.size() <= FrameIndex)
+	{
+		DataPerFrames.resize(FrameIndex + 1);
+	}
+	auto& BrickedData = DataPerFrames[FrameIndex].BrickedData;
+	BrickedData.resize(SizeOfVoxelType(VDBParams.VoxelType) * BrickNum * VoxelNumPerAtlasBrick);
+	auto& BrickSortKeys = DataPerFrames[FrameIndex].BrickSortKeys;
+	BrickSortKeys.clear();
+	auto& dBrickSortKeys = DataPerFrames[FrameIndex].dBrickSortKeys;
+
+	std::vector<uint8_t> BrickValids(BrickNum, 0);
+	auto Assign = [&]<typename T>(T* Dst, const T* Src, const CoordType& BrickCoord) {
+		auto Sample = [&](CoordType Coord) -> T {
+			Coord = glm::clamp(Coord, CoordType(0), VDBParams.VoxelPerVolume - 1);
+			return Src[Coord.z * VoxelYxX + Coord.y * VDBParams.VoxelPerVolume.x + Coord.x];
+		};
+
+		CoordType MinCoord = BrickCoord * VDBParams.ChildPerLevels[0];
+		uint32_t  BrickIndex =
+			BrickCoord.z * BrickYxX + BrickCoord.y * VDBParams.BrickPerVolume.x + BrickCoord.x;
+
+		uint32_t  EmptyVoxelNum = 0;
+		T*		  DstPitchPtr = nullptr;
+		CoordType dCoord;
+		for (dCoord.z = VoxelApronOffset;
+			 dCoord.z < VDBParams.VoxelPerAtlasBrick - VoxelApronOffset; ++dCoord.z)
+		{
+			DstPitchPtr = Dst + BrickIndex * VoxelNumPerAtlasBrick
+				+ dCoord.z * VoxelYxXPerAtlasBrick
+				+ VoxelApronOffset * VDBParams.VoxelPerAtlasBrick;
+
+			for (dCoord.y = VoxelApronOffset;
+				 dCoord.y < VDBParams.VoxelPerAtlasBrick - VoxelApronOffset; ++dCoord.y)
+			{
+				for (dCoord.x = VoxelApronOffset;
+					 dCoord.x < VDBParams.VoxelPerAtlasBrick - VoxelApronOffset; ++dCoord.x)
+				{
+					T Scalar = Sample(MinCoord + dCoord - VDBParams.ApronAndDepthWidth);
+					DstPitchPtr[dCoord.x] = Scalar;
+
+					bool bInBrick = true;
+					for (int32_t Axis = 0; Axis < 3; ++Axis)
+					{
+						if (dCoord[Axis] < VDBParams.ApronAndDepthWidth
+							|| dCoord[Axis] > MaxCoordValInAtlasBrick)
+						{
+							bInBrick = false;
+							break;
+						}
+					}
+					if (!bInBrick)
+						continue;
+
+					for (uint32_t RngIdx = 0; RngIdx < EmptyScalarRanges.size(); ++RngIdx)
+					{
+						glm::vec2 Range = EmptyScalarRanges[RngIdx];
+						if (Range[0] <= Scalar && Scalar <= Range[1])
+						{
+							++EmptyVoxelNum;
+							break;
+						}
+					}
+				}
+
+				DstPitchPtr += VDBParams.VoxelPerAtlasBrick;
+			}
+		}
+
+		if (EmptyVoxelNum < VoxelNumPerBrick)
+		{
+			BrickValids[BrickIndex] = 1;
+		}
+	};
+
+	{
+		uint32_t  BrickIndex = 0;
+		CoordType BrickCoord;
+		for (BrickCoord.z = 0; BrickCoord.z < VDBParams.BrickPerVolume.z; ++BrickCoord.z)
+			for (BrickCoord.y = 0; BrickCoord.y < VDBParams.BrickPerVolume.y; ++BrickCoord.y)
+				for (BrickCoord.x = 0; BrickCoord.x < VDBParams.BrickPerVolume.x; ++BrickCoord.x)
+				{
+					switch (VDBParams.VoxelType)
+					{
+						case EVoxelType::UInt8:
+							Futures[BrickIndex] =
+								std::async(Assign, reinterpret_cast<uint8_t*>(BrickedData.data()),
+									reinterpret_cast<const uint8_t*>(RAWVolumeData), BrickCoord);
+							break;
+						case EVoxelType::UInt16:
+							Futures[BrickIndex] =
+								std::async(Assign, reinterpret_cast<uint16_t*>(BrickedData.data()),
+									reinterpret_cast<const uint16_t*>(RAWVolumeData), BrickCoord);
+							break;
+						case EVoxelType::Float32:
+							Futures[BrickIndex] =
+								std::async(Assign, reinterpret_cast<float*>(BrickedData.data()),
+									reinterpret_cast<const float*>(RAWVolumeData), BrickCoord);
+							break;
+						default:
+							assert(false);
+					}
+
+					++BrickIndex;
+				}
+		for (auto& Future : Futures)
+		{
+			Future.wait();
+		}
 	}
 
+	{
+		uint32_t ValidBrickNum = std::count_if(
+			BrickValids.begin(), BrickValids.end(), [](uint8_t Valid) { return Valid == 1; });
+
+		BrickSortKeys.reserve(ValidBrickNum);
+		BrickSortKey BSKey;
+		BSKey.LevelPosition.Level = 0;
+		for (uint32_t BrickIndex = 0; BrickIndex < BrickNum; ++BrickIndex)
+		{
+			if (BrickValids[BrickIndex] == 0)
+				continue;
+
+			uint32_t		   BrickIndexWithFrame = FrameIndex * BrickNum + BrickIndex;
+			CoordWithFrameType BrickCoordWithFrame = BrickIndexToCoord(BrickIndexWithFrame);
+
+			BSKey.LevelPosition.X = BrickCoordWithFrame.x;
+			BSKey.LevelPosition.Y = BrickCoordWithFrame.y;
+			BSKey.LevelPosition.Z = BrickCoordWithFrame.z;
+			BrickSortKeys.emplace_back(BSKey);
+		}
+
+		dBrickSortKeys.resize(ValidBrickNum);
+		CUDA_CHECK(cudaMemcpyAsync(thrust::raw_pointer_cast(dBrickSortKeys.data()),
+			BrickSortKeys.data(), sizeof(BrickSortKey) * ValidBrickNum, cudaMemcpyHostToDevice,
+			getStream(EStream::Copy)));
+	}
+}
+
+bool DepthBoxVDB::VolData::VDB::allocateResource()
+{
+	uint32_t FrameNum = GetFrameNum();
+
+	// Compute NeededVoxelPerAtlas
+	CoordType NeededVoxelPerAtlas;
+	{
+		uint32_t NeededValidBrickNumInPlayLoop = 0;
+		for (MaxResidentFrameNum = 1;
+			 MaxResidentFrameNum <= std::min(FrameNum, MaxAllowedResidentFrameNum);
+			 ++MaxResidentFrameNum)
+		{
+			size_t NeededGPUMemInByteInPlayLoop = 0;
+			// TODO: To avoid double for-loop, rmeove prev and add next
+			for (uint32_t StartFrmIdx = 0; StartFrmIdx < FrameNum; ++StartFrmIdx)
+			{
+				uint32_t EndFrmIdx = StartFrmIdx + MaxResidentFrameNum;
+				size_t	 NeededGPUMemInByte = 0;
+				for (uint32_t FrameIndex = StartFrmIdx; FrameIndex <= EndFrmIdx; ++FrameIndex)
+				{
+					NeededGPUMemInByte += DataPerFrames[FrameIndex % FrameNum].BrickSortKeys.size();
+				}
+
+				NeededValidBrickNumInPlayLoop = std::max(
+					NeededValidBrickNumInPlayLoop, static_cast<uint32_t>(NeededGPUMemInByte));
+				NeededGPUMemInByte *= SizeOfVoxelType(VDBParams.VoxelType)
+					* VDBParams.VoxelPerAtlasBrick * VDBParams.VoxelPerAtlasBrick
+					* VDBParams.VoxelPerAtlasBrick;
+				NeededGPUMemInByteInPlayLoop =
+					std::max(NeededGPUMemInByteInPlayLoop, NeededGPUMemInByte);
+			}
+
+			if (NeededGPUMemInByteInPlayLoop > MaxAllowedGPUMemoryInByte)
+				break;
+		}
+		--MaxResidentFrameNum;
+
+		if (MaxResidentFrameNum == 0)
+		{
+			std::cerr << "MaxAllowedGPUMemory is too small.\n";
+			return false;
+		}
+
+		NeededVoxelPerAtlas.x = VDBParams.BrickPerVolume.x;
+		NeededVoxelPerAtlas.y = VDBParams.BrickPerVolume.y;
+		NeededVoxelPerAtlas.z = 1;
+		while ([&]() {
+			return static_cast<uint32_t>(NeededVoxelPerAtlas.z) * NeededVoxelPerAtlas.y
+				* NeededVoxelPerAtlas.z
+				< NeededValidBrickNumInPlayLoop;
+		}())
+		{
+			++NeededVoxelPerAtlas.z;
+		}
+		BrickPerAtlas = NeededVoxelPerAtlas;
+		NeededVoxelPerAtlas *= VDBParams.VoxelPerAtlasBrick;
+
+		size_t AtlasGPUMemInByte = SizeOfVoxelType(VDBParams.VoxelType) * NeededVoxelPerAtlas.z
+			* NeededVoxelPerAtlas.y * NeededVoxelPerAtlas.z;
+		if (AtlasGPUMemInByte > MaxAllowedGPUMemoryInByte)
+		{
+			std::cerr << "MaxAllowedGPUMemory is too small.\n";
+			return false;
+		}
+	}
+
+	// Resize Atlas
+	{
+		cudaChannelFormatDesc ChannelDesc;
+		switch (VDBParams.VoxelType)
+		{
+			case EVoxelType::UInt8:
+				ChannelDesc = cudaCreateChannelDesc<uint8_t>();
+				break;
+			case EVoxelType::UInt16:
+				ChannelDesc = cudaCreateChannelDesc<uint16_t>();
+				break;
+			case EVoxelType::Float32:
+				ChannelDesc = cudaCreateChannelDesc<float>();
+				break;
+			default:
+				assert(false);
+		}
+		AtlasArray = std::make_shared<CUDA::Array>(ChannelDesc, NeededVoxelPerAtlas);
+	}
+
+	// Create Texture and Surface
+	AtlasTexture = std::make_unique<CUDA::Texture>(AtlasArray);
+	AtlasSurface = std::make_unique<CUDA::Surface>(AtlasArray);
+
+	// Init Mapping Tables
+	BrickWithFrameToAtlasBrick.assign(FrameNum * VDBParams.BrickPerVolume.z
+			* VDBParams.BrickPerVolume.y * VDBParams.BrickPerVolume.z,
+		kInvalidIndex);
+	dBrickWithFrameToAtlasBrick.resize(BrickWithFrameToAtlasBrick.size());
+
+	uint32_t AtlasBrickNum =
+		static_cast<uint32_t>(BrickPerAtlas.z) * BrickPerAtlas.y * BrickPerAtlas.x;
+	AtlasBrickToBrickWithFrame.assign(AtlasBrickNum, kInvalidIndex);
+	dAtlasBrickToBrickWithFrame.resize(AtlasBrickNum);
+	AvailableAtlasBrick.reserve(AtlasBrickNum);
+	for (uint32_t BrickIndex = 0; BrickIndex < AtlasBrickNum; ++BrickIndex)
+	{
+		AvailableAtlasBrick.emplace_back(BrickIndex);
+	}
+
+	return true;
+}
+
+void DepthBoxVDB::VolData::VDB::transferBrickDataToAtlas(uint32_t ResidentIndex)
+{
+	uint32_t VoxelNumPerAtlasBrick = static_cast<uint32_t>(VDBParams.VoxelPerAtlasBrick)
+		* VDBParams.VoxelPerAtlasBrick * VDBParams.VoxelPerAtlasBrick;
+	uint32_t AtlasBrickNum =
+		static_cast<uint32_t>(BrickPerAtlas.z) * BrickPerAtlas.y * BrickPerAtlas.x;
+	uint32_t BrickNum = static_cast<uint32_t>(VDBParams.BrickPerVolume.z)
+		* VDBParams.BrickPerVolume.y * VDBParams.BrickPerVolume.x;
+
+	auto&	 RsdDataPF = ResidentDataPerFrames[ResidentIndex];
+	uint32_t FrameIndex = RsdDataPF.FrameIndex;
+	auto&	 BrickedData = DataPerFrames[FrameIndex].BrickedData;
+
+	auto TransferBrick = [&]<typename T>(T* Src, uint32_t BrickIndex, uint32_t AtlasBrickIndex) {
+		CoordType AtlasBrickCoord = AtlasBrickIndexToCoord(AtlasBrickIndex);
+
+		cudaMemcpy3DParms MemCpyParams{};
+		MemCpyParams.srcPtr = make_cudaPitchedPtr(Src + BrickIndex * VoxelNumPerAtlasBrick,
+			sizeof(T) * VDBParams.VoxelPerAtlasBrick, VDBParams.VoxelPerAtlasBrick,
+			VDBParams.VoxelPerAtlasBrick);
+		MemCpyParams.extent = make_cudaExtent(VDBParams.VoxelPerAtlasBrick,
+			VDBParams.VoxelPerAtlasBrick, VDBParams.VoxelPerAtlasBrick);
+		MemCpyParams.dstArray = AtlasArray->Get();
+		MemCpyParams.dstPos.x = AtlasBrickCoord.x * VDBParams.VoxelPerAtlasBrick;
+		MemCpyParams.dstPos.y = AtlasBrickCoord.y * VDBParams.VoxelPerAtlasBrick;
+		MemCpyParams.dstPos.z = AtlasBrickCoord.z * VDBParams.VoxelPerAtlasBrick;
+		MemCpyParams.kind = cudaMemcpyHostToDevice;
+
+		CUDA_CHECK(cudaMemcpy3DAsync(&MemCpyParams, getStream(EStream::Copy)));
+	};
+
+	RsdDataPF.Wait(getStream(EStream::Copy), ResidentDataPerFrame::EEvent::TransferBrickDataToCPU);
+	for (auto [BrickIndexWithFrame, AtlasBrickIndex] : RsdDataPF.BrickWithFrameToAtlasBrick)
+	{
+		uint32_t BrickIndex = BrickIndexWithFrame - FrameIndex * BrickNum;
+		switch (VDBParams.VoxelType)
+		{
+			case EVoxelType::UInt8:
+				TransferBrick(
+					reinterpret_cast<uint8_t*>(BrickedData.data()), BrickIndex, AtlasBrickIndex);
+				break;
+			case EVoxelType::UInt16:
+				TransferBrick(
+					reinterpret_cast<uint16_t*>(BrickedData.data()), BrickIndex, AtlasBrickIndex);
+				break;
+			case EVoxelType::Float32:
+				TransferBrick(
+					reinterpret_cast<float*>(BrickedData.data()), BrickIndex, AtlasBrickIndex);
+				break;
+			default:
+				assert(false);
+		}
+	}
+	// Transfer Mapping
+	{
+		uint32_t* dPtr = thrust::raw_pointer_cast(dBrickWithFrameToAtlasBrick.data());
+		dPtr += FrameIndex * BrickNum;
+		uint32_t* Ptr = BrickWithFrameToAtlasBrick.data();
+		Ptr += FrameIndex * BrickNum;
+		CUDA_CHECK(cudaMemcpyAsync(dPtr, Ptr, sizeof(uint32_t) * BrickNum, cudaMemcpyHostToDevice,
+			getStream(EStream::Copy)));
+
+		// Inverse mapping cannot be copied incrementally
+		dPtr = thrust::raw_pointer_cast(dAtlasBrickToBrickWithFrame.data());
+		Ptr = AtlasBrickToBrickWithFrame.data();
+		CUDA_CHECK(cudaMemcpyAsync(dPtr, Ptr, sizeof(uint32_t) * AtlasBrickNum,
+			cudaMemcpyHostToDevice, getStream(EStream::Copy)));
+	}
+	RsdDataPF.Record(
+		ResidentDataPerFrame::EEvent::TransferBrickDataToAtlas, getStream(EStream::Copy));
+}
+
+void DepthBoxVDB::VolData::VDB::updateDepthBox(uint32_t ResidentIndex)
+{
+	auto&	 RsdDataPF = ResidentDataPerFrames[ResidentIndex];
+	uint32_t FrameIndex = RsdDataPF.FrameIndex;
+	auto&	 DataPF = DataPerFrames[FrameIndex];
+	if (DataPF.bUpdatedFromEmptyScalarRanges)
+		return;
+
+	RsdDataPF.Wait(
+		getStream(EStream::Atlas), ResidentDataPerFrame::EEvent::TransferBrickDataToAtlas);
 	switch (VDBParams.VoxelType)
 	{
 		case EVoxelType::UInt8:
-			updateDepthBoxAsync<uint8_t>(Params);
+			updateDepthBox<uint8_t>(FrameIndex);
 			break;
 		case EVoxelType::UInt16:
-			updateDepthBoxAsync<uint16_t>(Params);
+			updateDepthBox<uint16_t>(FrameIndex);
 			break;
 		case EVoxelType::Float32:
-			updateDepthBoxAsync<float>(Params);
+			updateDepthBox<float>(FrameIndex);
 			break;
 		default:
 			assert(false);
 	}
+	RsdDataPF.Record(ResidentDataPerFrame::EEvent::UpdateDepthBox, getStream(EStream::Atlas));
+
+	DataPF.bUpdatedFromEmptyScalarRanges = true;
+	DataPF.bTransferredToCPU = false;
 }
 
-template <typename VoxelType>
-void DepthBoxVDB::VolData::VDB::updateDepthBoxAsync(const UpdateDepthBoxParameters& Params)
+template <typename VoxelType> void DepthBoxVDB::VolData::VDB::updateDepthBox(uint32_t FrameIndex)
 {
 	uint32_t BrickYxXPerAtlas = BrickPerAtlas.x * BrickPerAtlas.y;
 	uint32_t VoxelYxXPerBrick = VDBParams.ChildPerLevels[0] * VDBParams.ChildPerLevels[0];
@@ -365,15 +633,9 @@ void DepthBoxVDB::VolData::VDB::updateDepthBoxAsync(const UpdateDepthBoxParamete
 		static_cast<uint32_t>(BrickPerAtlas.z) * BrickPerAtlas.y * BrickPerAtlas.x;
 	uint32_t DepthVoxelNumPerAtlas = BrickNumPerAtlas * 6 * VoxelYxXPerBrick;
 
-	thrust::device_vector<glm::vec2> dEmptyScalarRanges(Params.EmptyScalarRangeNum);
-	// Sync here since EmptyScalarRanges cannot be maintained by this
-	CUDA_CHECK(
-		cudaMemcpy(thrust::raw_pointer_cast(dEmptyScalarRanges.data()), Params.EmptyScalarRanges,
-			sizeof(glm::vec2) * Params.EmptyScalarRangeNum, cudaMemcpyHostToDevice));
-
 	auto UpdateKernel = [DepthVoxelNumPerAtlas, VoxelYxXPerBrick, BrickYxXPerAtlas,
 							BrickPerAtlas = BrickPerAtlas,
-							EmptyScalarRangeNum = Params.EmptyScalarRangeNum,
+							EmptyScalarRangeNum = static_cast<uint32_t>(EmptyScalarRanges.size()),
 							EmptyScalarRanges = thrust::raw_pointer_cast(dEmptyScalarRanges.data()),
 							AtlasSurface = AtlasSurface->Get(), AtlasTexture = AtlasTexture->Get(),
 							VDBParams = VDBParams] __device__(uint32_t DepthVoxelIndex) {
@@ -539,342 +801,287 @@ void DepthBoxVDB::VolData::VDB::updateDepthBoxAsync(const UpdateDepthBoxParamete
 			Depth, AtlasSurface, sizeof(VoxelType) * DepthCoord.x, DepthCoord.y, DepthCoord.z);
 	};
 
-	thrust::for_each(thrust::cuda::par.on(AtlasStream), thrust::make_counting_iterator(uint32_t(0)),
+	thrust::for_each(thrust::cuda::par_nosync.on(getStream(EStream::Atlas)),
+		thrust::make_counting_iterator(uint32_t(0)),
 		thrust::make_counting_iterator(DepthVoxelNumPerAtlas), UpdateKernel);
 }
-template void DepthBoxVDB::VolData::VDB::updateDepthBoxAsync<uint8_t>(
-	const UpdateDepthBoxParameters& Params);
-template void DepthBoxVDB::VolData::VDB::updateDepthBoxAsync<uint16_t>(
-	const UpdateDepthBoxParameters& Params);
-template void DepthBoxVDB::VolData::VDB::updateDepthBoxAsync<float>(
-	const UpdateDepthBoxParameters& Params);
+template void DepthBoxVDB::VolData::VDB::updateDepthBox<uint8_t>(uint32_t FrameIndex);
+template void DepthBoxVDB::VolData::VDB::updateDepthBox<uint16_t>(uint32_t FrameIndex);
+template void DepthBoxVDB::VolData::VDB::updateDepthBox<float>(uint32_t FrameIndex);
 
-DepthBoxVDB::VolData::VDBData* DepthBoxVDB::VolData::VDB::GetDeviceData() const
+void DepthBoxVDB::VolData::VDB::transferBrickDataToCPU(uint32_t ResidentIndex)
 {
-	if (ValidBrickNum == 0)
-		return nullptr;
-
-	CUDA_CHECK(cudaStreamSynchronize(AtlasStream));
-	CUDA_CHECK(cudaStreamSynchronize(NodeStream));
-	return dData;
-}
-
-void DepthBoxVDB::VolData::VDB::relayoutRAWVolume(const FullBuildParameters& Params)
-{
-	uint32_t VoxelYxX = VDBParams.VoxelPerVolume.x * VDBParams.VoxelPerVolume.y;
-	uint32_t VoxelYxXPerAtlasBrick = VDBParams.VoxelPerAtlasBrick * VDBParams.VoxelPerAtlasBrick;
-	uint32_t BrickYxX = VDBParams.BrickPerVolume.x * VDBParams.BrickPerVolume.y;
-	uint32_t BrickNum = BrickYxX * VDBParams.BrickPerVolume.z;
-	uint32_t MaxCoordValInAtlasBrick =
-		VDBParams.ApronAndDepthWidth + VDBParams.ChildPerLevels[0] - 1;
-	uint32_t VoxelNumPerAtlasBrick = VoxelYxXPerAtlasBrick * VDBParams.VoxelPerAtlasBrick;
-	uint32_t VoxelApronOffset = VDBParams.ApronAndDepthWidth - VDBParams.ApronWidth;
-	uint32_t VoxelNumPerBrick = static_cast<uint32_t>(VDBParams.ChildPerLevels[0]);
-	VoxelNumPerBrick = VoxelNumPerBrick * VoxelNumPerBrick * VoxelNumPerBrick;
-
-	std::vector<std::future<void>> Futures(BrickNum);
-	BrickToAtlasBrick.assign(BrickNum, CoordType(kInvalidCoordValue));
-	dBrickToAtlasBrick.resize(BrickNum);
-	BrickedData.resize(SizeOfVoxelType(VDBParams.VoxelType) * BrickNum * VoxelNumPerAtlasBrick);
-
-	auto Assign = [&]<typename T>(T* Dst, const T* Src, const CoordType& BrickCoord) {
-		auto Sample = [&](CoordType Coord) -> T {
-			Coord = glm::clamp(Coord, CoordType(0), VDBParams.VoxelPerVolume - 1);
-			return Src[Coord.z * VoxelYxX + Coord.y * VDBParams.VoxelPerVolume.x + Coord.x];
-		};
-
-		CoordType MinCoord = BrickCoord * VDBParams.ChildPerLevels[0];
-		uint32_t  BrickIndex =
-			BrickCoord.z * BrickYxX + BrickCoord.y * VDBParams.BrickPerVolume.x + BrickCoord.x;
-
-		uint32_t  EmptyVoxelNum = 0;
-		T*		  DstPitchPtr = nullptr;
-		CoordType dCoord;
-		for (dCoord.z = VoxelApronOffset;
-			 dCoord.z < VDBParams.VoxelPerAtlasBrick - VoxelApronOffset; ++dCoord.z)
-		{
-			DstPitchPtr = Dst + BrickIndex * VoxelNumPerAtlasBrick
-				+ dCoord.z * VoxelYxXPerAtlasBrick
-				+ VoxelApronOffset * VDBParams.VoxelPerAtlasBrick;
-
-			for (dCoord.y = VoxelApronOffset;
-				 dCoord.y < VDBParams.VoxelPerAtlasBrick - VoxelApronOffset; ++dCoord.y)
-			{
-				for (dCoord.x = VoxelApronOffset;
-					 dCoord.x < VDBParams.VoxelPerAtlasBrick - VoxelApronOffset; ++dCoord.x)
-				{
-					T Scalar = Sample(MinCoord + dCoord - VDBParams.ApronAndDepthWidth);
-					DstPitchPtr[dCoord.x] = Scalar;
-
-					bool bInBrick = true;
-					for (int32_t Axis = 0; Axis < 3; ++Axis)
-					{
-						if (dCoord[Axis] < VDBParams.ApronAndDepthWidth
-							|| dCoord[Axis] > MaxCoordValInAtlasBrick)
-						{
-							bInBrick = false;
-							break;
-						}
-					}
-					if (!bInBrick)
-						continue;
-
-					for (uint32_t RngIdx = 0; RngIdx < Params.EmptyScalarRangeNum; ++RngIdx)
-					{
-						glm::vec2 Range = Params.EmptyScalarRanges[RngIdx];
-						if (Range[0] <= Scalar && Scalar <= Range[1])
-						{
-							++EmptyVoxelNum;
-							break;
-						}
-					}
-				}
-
-				DstPitchPtr += VDBParams.VoxelPerAtlasBrick;
-			}
-		}
-
-		if (EmptyVoxelNum < VoxelNumPerBrick)
-		{
-			BrickToAtlasBrick[BrickIndex] = BrickCoord;
-		}
-	};
-
-	{
-		uint32_t  BrickIndex = 0;
-		CoordType BrickCoord;
-		for (BrickCoord.z = 0; BrickCoord.z < VDBParams.BrickPerVolume.z; ++BrickCoord.z)
-			for (BrickCoord.y = 0; BrickCoord.y < VDBParams.BrickPerVolume.y; ++BrickCoord.y)
-				for (BrickCoord.x = 0; BrickCoord.x < VDBParams.BrickPerVolume.x; ++BrickCoord.x)
-				{
-					switch (VDBParams.VoxelType)
-					{
-						case EVoxelType::UInt8:
-							Futures[BrickIndex] = std::async(Assign,
-								reinterpret_cast<uint8_t*>(BrickedData.data()),
-								reinterpret_cast<const uint8_t*>(Params.RAWVolumeData), BrickCoord);
-							break;
-						case EVoxelType::UInt16:
-							Futures[BrickIndex] =
-								std::async(Assign, reinterpret_cast<uint16_t*>(BrickedData.data()),
-									reinterpret_cast<const uint16_t*>(Params.RAWVolumeData),
-									BrickCoord);
-							break;
-						case EVoxelType::Float32:
-							Futures[BrickIndex] = std::async(Assign,
-								reinterpret_cast<float*>(BrickedData.data()),
-								reinterpret_cast<const float*>(Params.RAWVolumeData), BrickCoord);
-							break;
-						default:
-							assert(false);
-					}
-
-					++BrickIndex;
-				}
-		for (auto& Future : Futures)
-		{
-			Future.wait();
-		}
-	}
-
-	uint32_t AtlasBrickIndex = 0;
-	for (uint32_t BrickIndex = 0; BrickIndex < BrickNum; ++BrickIndex)
-	{
-		if (BrickToAtlasBrick[BrickIndex] == CoordType(kInvalidCoordValue))
-			continue;
-
-		CoordType AtlasBrickCoord;
-		AtlasBrickCoord.z = AtlasBrickIndex / BrickYxX;
-		uint32_t Tmp = AtlasBrickIndex - AtlasBrickCoord.z * BrickYxX;
-		AtlasBrickCoord.y = Tmp / VDBParams.BrickPerVolume.x;
-		AtlasBrickCoord.x = Tmp - AtlasBrickCoord.y * VDBParams.BrickPerVolume.x;
-
-		BrickToAtlasBrick[BrickIndex] = AtlasBrickCoord;
-
-		++AtlasBrickIndex;
-	}
-	ValidBrickNum = AtlasBrickIndex;
-
-	if (ValidBrickNum == 0)
+	auto&	 RsdDataPF = ResidentDataPerFrames[ResidentIndex];
+	uint32_t FrameIndex = RsdDataPF.FrameIndex;
+	auto&	 DataPF = DataPerFrames[FrameIndex];
+	if (!DataPF.bTransferredToCPU)
 		return;
-	if (!resizeAtlas())
-	{
-		ValidBrickNum = 0;
-		return;
-	}
 
-	uint32_t AtlasBrickNum =
-		static_cast<uint32_t>(BrickPerAtlas.z) * BrickPerAtlas.y * BrickPerAtlas.x;
-	AtlasBrickToBrick.assign(AtlasBrickNum, CoordType(kInvalidCoordValue));
-	dAtlasBrickToBrick.resize(AtlasBrickNum);
-
-	AtlasBrickIndex = 0;
-	for (uint32_t BrickIndex = 0; BrickIndex < BrickNum; ++BrickIndex)
-	{
-		if (BrickToAtlasBrick[BrickIndex] == CoordType(kInvalidCoordValue))
-			continue;
-
-		CoordType BrickCoord;
-		BrickCoord.z = BrickIndex / BrickYxX;
-		uint32_t Tmp = BrickIndex - BrickCoord.z * BrickYxX;
-		BrickCoord.y = Tmp / VDBParams.BrickPerVolume.x;
-		BrickCoord.x = Tmp - BrickCoord.y * VDBParams.BrickPerVolume.x;
-
-		AtlasBrickToBrick[AtlasBrickIndex] = BrickCoord;
-
-		++AtlasBrickIndex;
-	}
-
-#ifdef ENABLE_CUDA_DEBUG_IN_CPU
-	{
-		std::string DebugMsg = "CUDA Debug Brick <-> AtlasBrick:\n\t";
-		for (uint32_t BrickIndex = 0; BrickIndex < BrickNum; ++BrickIndex)
-		{
-			if (BrickToAtlasBrick[BrickIndex] == CoordType(kInvalidCoordValue))
-				continue;
-
-			DebugMsg += std::format(
-				"b2a:{}->{}, ", BrickIndex, glm::to_string(BrickToAtlasBrick[BrickIndex]));
-		}
-		DebugMsg += "\n\t";
-
-		for (uint32_t AtlasBrickIndex = 0; AtlasBrickIndex < AtlasBrickNum; ++AtlasBrickIndex)
-		{
-			if (AtlasBrickToBrick[AtlasBrickIndex] == CoordType(kInvalidCoordValue))
-				continue;
-
-			DebugMsg += std::format("a2b:{}->{}, ", AtlasBrickIndex,
-				glm::to_string(AtlasBrickToBrick[AtlasBrickIndex]));
-		}
-		DebugMsg += "\n";
-
-		std::cout << DebugMsg;
-	}
-#endif
-
-	updateAtlas();
-	CUDA_CHECK(cudaMemcpyAsync(thrust::raw_pointer_cast(dAtlasBrickToBrick.data()),
-		AtlasBrickToBrick.data(), sizeof(CoordType) * AtlasBrickToBrick.size(),
-		cudaMemcpyHostToDevice, AtlasStream));
-	CUDA_CHECK(cudaMemcpyAsync(thrust::raw_pointer_cast(dBrickToAtlasBrick.data()),
-		BrickToAtlasBrick.data(), sizeof(CoordType) * BrickToAtlasBrick.size(),
-		cudaMemcpyHostToDevice, AtlasStream));
-
-	CUDA_CHECK(cudaStreamSynchronize(AtlasStream));
-}
-
-bool DepthBoxVDB::VolData::VDB::resizeAtlas()
-{
-	CoordType NeededVoxelPerAtlas;
-	// Compute NeededVoxelPerAtlas
-	{
-		BrickPerAtlas = VDBParams.BrickPerVolume;
-		BrickPerAtlas.z = 0;
-
-		while (static_cast<uint32_t>(BrickPerAtlas.z) * BrickPerAtlas.y * BrickPerAtlas.x
-			< ValidBrickNum)
-		{
-			++BrickPerAtlas.z;
-		}
-		NeededVoxelPerAtlas = BrickPerAtlas * VDBParams.VoxelPerAtlasBrick;
-
-		size_t MaxAllowedGPUMemoryInByte =
-			SizeOfVoxelType(VDBParams.VoxelType) * MaxAllowedGPUMemoryInGB * (1 << 30);
-		if (SizeOfVoxelType(VDBParams.VoxelType) * NeededVoxelPerAtlas.x * NeededVoxelPerAtlas.y
-				* NeededVoxelPerAtlas.z
-			> MaxAllowedGPUMemoryInByte)
-		{
-			std::cerr << "MaxAllowedGPUMemoryInGB is too small.\n";
-			return false;
-		}
-
-		if (AtlasArray && [&]() {
-				auto Extent = AtlasArray->GetExtent();
-				return Extent.width == NeededVoxelPerAtlas.x
-					&& Extent.height == NeededVoxelPerAtlas.y
-					&& Extent.depth == NeededVoxelPerAtlas.z;
-			}())
-			return true;
-	}
-
-	// Resize Atlas
-	{
-		cudaChannelFormatDesc ChannelDesc;
-		switch (VDBParams.VoxelType)
-		{
-			case EVoxelType::UInt8:
-				ChannelDesc = cudaCreateChannelDesc<uint8_t>();
-				break;
-			case EVoxelType::UInt16:
-				ChannelDesc = cudaCreateChannelDesc<uint16_t>();
-				break;
-			case EVoxelType::Float32:
-				ChannelDesc = cudaCreateChannelDesc<float>();
-				break;
-			default:
-				assert(false);
-		}
-		AtlasArray = std::make_shared<CUDA::Array>(ChannelDesc, NeededVoxelPerAtlas);
-	}
-
-	// Create Texture and Surface
-	AtlasTexture = std::make_unique<CUDA::Texture>(AtlasArray);
-	AtlasSurface = std::make_unique<CUDA::Surface>(AtlasArray);
-
-	return true;
-}
-
-void DepthBoxVDB::VolData::VDB::updateAtlas()
-{
-	uint32_t BrickYxX = VDBParams.BrickPerVolume.x * VDBParams.BrickPerVolume.y;
+	uint32_t BrickNum = static_cast<uint32_t>(VDBParams.BrickPerVolume.z)
+		* VDBParams.BrickPerVolume.y * VDBParams.BrickPerVolume.x;
 	uint32_t VoxelNumPerAtlasBrick = static_cast<uint32_t>(VDBParams.VoxelPerAtlasBrick)
 		* VDBParams.VoxelPerAtlasBrick * VDBParams.VoxelPerAtlasBrick;
 
-	auto Transfer = [&]<typename T>(T* Src, uint32_t AtlasBrickIndex) {
-		CoordType BrickCoord = AtlasBrickToBrick[AtlasBrickIndex];
-		uint32_t  BrickIndex = static_cast<uint32_t>(BrickCoord.z) * BrickYxX
-			+ BrickCoord.y * VDBParams.BrickPerVolume.x + BrickCoord.x;
+	auto& BrickedData = DataPerFrames[FrameIndex].BrickedData;
 
-		CoordType AtlasBrickCoord;
-		AtlasBrickCoord.z = AtlasBrickIndex / BrickYxX;
-		uint32_t Tmp = AtlasBrickIndex - AtlasBrickCoord.z * BrickYxX;
-		AtlasBrickCoord.y = Tmp / VDBParams.BrickPerVolume.x;
-		AtlasBrickCoord.x = Tmp - AtlasBrickCoord.y * VDBParams.BrickPerVolume.x;
+	auto Transfer = [&]<typename T>(T* Dst, uint32_t BrickIndex, uint32_t AtlasBrickIndex) {
+		CoordType AtlasBrickCoord = AtlasBrickIndexToCoord(AtlasBrickIndex);
 
 		cudaMemcpy3DParms MemCpyParams{};
-		MemCpyParams.srcPtr = make_cudaPitchedPtr(Src + BrickIndex * VoxelNumPerAtlasBrick,
-			sizeof(T) * VDBParams.VoxelPerAtlasBrick, VDBParams.VoxelPerAtlasBrick,
-			VDBParams.VoxelPerAtlasBrick);
+		MemCpyParams.srcArray = AtlasArray->Get();
+		MemCpyParams.srcPos.x = AtlasBrickCoord.x * VDBParams.VoxelPerAtlasBrick;
+		MemCpyParams.srcPos.y = AtlasBrickCoord.y * VDBParams.VoxelPerAtlasBrick;
+		MemCpyParams.srcPos.z = AtlasBrickCoord.z * VDBParams.VoxelPerAtlasBrick;
 		MemCpyParams.extent = make_cudaExtent(VDBParams.VoxelPerAtlasBrick,
 			VDBParams.VoxelPerAtlasBrick, VDBParams.VoxelPerAtlasBrick);
-		MemCpyParams.dstArray = AtlasArray->Get();
-		MemCpyParams.dstPos.x = AtlasBrickCoord.x * VDBParams.VoxelPerAtlasBrick;
-		MemCpyParams.dstPos.y = AtlasBrickCoord.y * VDBParams.VoxelPerAtlasBrick;
-		MemCpyParams.dstPos.z = AtlasBrickCoord.z * VDBParams.VoxelPerAtlasBrick;
-		MemCpyParams.kind = cudaMemcpyHostToDevice;
+		MemCpyParams.dstPtr = make_cudaPitchedPtr(Dst + BrickIndex * VoxelNumPerAtlasBrick,
+			sizeof(T) * VDBParams.VoxelPerAtlasBrick, VDBParams.VoxelPerAtlasBrick,
+			VDBParams.VoxelPerAtlasBrick);
+		MemCpyParams.kind = cudaMemcpyDeviceToHost;
 
-		CUDA_CHECK(cudaMemcpy3DAsync(&MemCpyParams, AtlasStream));
+		CUDA_CHECK(cudaMemcpy3DAsync(&MemCpyParams, getStream(EStream::Copy)));
 	};
 
-	for (uint32_t AtlasBrickIndex = 0; AtlasBrickIndex < AtlasBrickToBrick.size();
-		 ++AtlasBrickIndex)
+	RsdDataPF.Wait(getStream(EStream::Atlas), ResidentDataPerFrame::EEvent::UpdateDepthBox);
+	for (auto [BrickIndexWithFrame, AtlasBrickIndex] : RsdDataPF.BrickWithFrameToAtlasBrick)
 	{
-		if (AtlasBrickToBrick[AtlasBrickIndex] == CoordType(kInvalidCoordValue))
-			continue;
-
+		uint32_t BrickIndex = BrickIndexWithFrame - FrameIndex * BrickNum;
 		switch (VDBParams.VoxelType)
 		{
 			case EVoxelType::UInt8:
-				Transfer(reinterpret_cast<uint8_t*>(BrickedData.data()), AtlasBrickIndex);
+				Transfer(
+					reinterpret_cast<uint8_t*>(BrickedData.data()), BrickIndex, AtlasBrickIndex);
 				break;
 			case EVoxelType::UInt16:
-				Transfer(reinterpret_cast<uint16_t*>(BrickedData.data()), AtlasBrickIndex);
+				Transfer(
+					reinterpret_cast<uint16_t*>(BrickedData.data()), BrickIndex, AtlasBrickIndex);
 				break;
 			case EVoxelType::Float32:
-				Transfer(reinterpret_cast<float*>(BrickedData.data()), AtlasBrickIndex);
+				Transfer(reinterpret_cast<float*>(BrickedData.data()), BrickIndex, AtlasBrickIndex);
 				break;
 			default:
 				assert(false);
 		}
 	}
+	RsdDataPF.Record(
+		ResidentDataPerFrame::EEvent::TransferBrickDataToCPU, getStream(EStream::Copy));
+
+	DataPF.bTransferredToCPU = false;
+}
+
+void DepthBoxVDB::VolData::VDB::buildVDB(uint32_t ResidentIndex)
+{
+	auto& RsdDataPF = ResidentDataPerFrames[ResidentIndex];
+	auto& dNodePerLevels = RsdDataPF.dNodePerLevels;
+	auto& dChildPerLevels = RsdDataPF.dChildPerLevels;
+	auto& dVDBData = RsdDataPF.dVDBData;
+
+	uint32_t FrameIndex = RsdDataPF.FrameIndex;
+	uint32_t ValidBrickNum = DataPerFrames[FrameIndex].BrickSortKeys.size();
+	uint32_t BrickYxX = VDBParams.BrickPerVolume.x * VDBParams.BrickPerVolume.y;
+	uint32_t BrickNum = VDBParams.BrickPerVolume.z * BrickYxX;
+
+	auto& DataPF = DataPerFrames[FrameIndex];
+
+	RsdDataPF.Wait(getStream(EStream::VDB), ResidentDataPerFrame::EEvent::TransferBrickDataToAtlas);
+	RsdDataPF.Wait(getStream(EStream::VDB), ResidentDataPerFrame::EEvent::UpdateDepthBox);
+
+	// Assign Brick Sort Keys to non-emptY Brick at level 0
+	thrust::device_vector<BrickSortKey> dBrickSortKeys(
+		(VDBParams.RootLevel + 1) * ValidBrickNum, BrickSortKey::Invalid());
+	CUDA_CHECK(cudaMemcpyAsync(thrust::raw_pointer_cast(dBrickSortKeys.data()),
+		thrust::raw_pointer_cast(DataPF.dBrickSortKeys.data()),
+		sizeof(BrickSortKey) * ValidBrickNum, cudaMemcpyDeviceToDevice, getStream(EStream::VDB)));
+
+	// 1. Assign Brick Sort Keys to non-empty Brick at level 1,2,...
+	// 2. Sort Brick Sort Keys
+	{
+		auto AssignBrickKeysKernel = [BrickSortKeys =
+											 thrust::raw_pointer_cast(dBrickSortKeys.data()),
+										 BrickYxX, ValidBrickNum = ValidBrickNum,
+										 VDBParams = VDBParams] __device__(uint32_t ValidIndex) {
+			BrickSortKey BSKey = BrickSortKeys[ValidIndex];
+			uint64_t	 BSKIndex = ValidIndex;
+			for (int32_t Lev = 1; Lev <= VDBParams.RootLevel; ++Lev)
+			{
+				BSKey.LevelPosition.Level = Lev;
+				BSKey.LevelPosition.X /= VDBParams.ChildPerLevels[Lev];
+				BSKey.LevelPosition.Y /= VDBParams.ChildPerLevels[Lev];
+				BSKey.LevelPosition.Z /= VDBParams.ChildPerLevels[Lev];
+
+				BSKIndex = Lev * ValidBrickNum + ValidIndex;
+				BrickSortKeys[BSKIndex] = BSKey;
+			}
+		};
+
+		thrust::for_each(thrust::cuda::par_nosync.on(getStream(EStream::VDB)),
+			thrust::make_counting_iterator(uint32_t(0)),
+			thrust::make_counting_iterator(ValidBrickNum), AssignBrickKeysKernel);
+
+		thrust::sort(thrust::cuda::par_nosync.on(getStream(EStream::VDB)), dBrickSortKeys.begin(),
+			dBrickSortKeys.end());
+	}
+
+	// Compact Brick Sort Keys
+	{
+		auto dDiffs = CUDA::Difference<uint32_t>(dBrickSortKeys, 0, getStream(EStream::VDB));
+		dBrickSortKeys =
+			CUDA::Compact(dBrickSortKeys, dDiffs, uint32_t(0), getStream(EStream::VDB));
+
+#ifdef DEPTHBOX_DEBUG
+		CUDA_CHECK(cudaStreamSynchronize(getStream(EStream::VDB)));
+		CUDA_DEBUG_IN_CPU(dBrickSortKeys);
+#endif
+	}
+
+	// Allocate Node and Child Pools
+	{
+		uint32_t StartCurrLev = 0;
+		for (int32_t Lev = 0; Lev <= VDBParams.RootLevel; ++Lev)
+		{
+			uint32_t NumCurrLev = Lev == 0 ? ValidBrickNum
+				: Lev == VDBParams.RootLevel
+				? 1
+				: [&]() {
+					  BrickSortKey KeyNextLev;
+					  KeyNextLev.LevelPosition.Level = Lev + 1;
+					  KeyNextLev.LevelPosition.X = KeyNextLev.LevelPosition.Y =
+						  KeyNextLev.LevelPosition.Z = 0;
+
+					  auto ItrCurrLev = dBrickSortKeys.begin() + StartCurrLev;
+					  auto ItrNextLev =
+						  thrust::lower_bound(thrust::cuda::par.on(getStream(EStream::VDB)),
+							  ItrCurrLev, dBrickSortKeys.end(), KeyNextLev);
+
+					  return thrust::distance(ItrCurrLev, ItrNextLev);
+				  }();
+			StartCurrLev += NumCurrLev;
+
+			dNodePerLevels[Lev].assign(NumCurrLev, VDBNode::CreateInvalid());
+
+			if (Lev > 0)
+			{
+				uint64_t ChildCurrLev = VDBParams.ChildPerLevels[Lev];
+				dChildPerLevels[Lev - 1].assign(
+					dNodePerLevels[Lev].size() * ChildCurrLev * ChildCurrLev * ChildCurrLev,
+					VDBData::kInvalidChild);
+			}
+		}
+	}
+
+	// Upload
+	VDBData VDBData;
+	VDBData.VDBParams = VDBParams;
+	VDBData.AtlasTexture = AtlasTexture->Get();
+	VDBData.AtlasSurface = AtlasSurface->Get();
+	for (int32_t Lev = 0; Lev <= VDBParams.RootLevel; ++Lev)
+	{
+		VDBData.NodePerLevels[Lev] = thrust::raw_pointer_cast(dNodePerLevels[Lev].data());
+		if (Lev > 0)
+		{
+			VDBData.ChildPerLevels[Lev - 1] =
+				thrust::raw_pointer_cast(dChildPerLevels[Lev - 1].data());
+		}
+	}
+	CUDA_CHECK(cudaMemcpyAsync(
+		dVDBData, &VDBData, sizeof(VDBData), cudaMemcpyHostToDevice, getStream(EStream::VDB)));
+
+	// Assign Node and Child Pools
+	{
+		auto AssignNodePoolsKernel = [BrickYxX, BrickNum, FrameIndex,
+										 BrickPerAtlas = this->BrickPerAtlas, VDBData = dVDBData,
+										 BrickWithFrameToAtlasBrick = thrust::raw_pointer_cast(
+											 dBrickWithFrameToAtlasBrick.data()),
+										 BrickSortKeys = thrust::raw_pointer_cast(
+											 dBrickSortKeys.data())] __device__(int32_t Level,
+										 uint64_t NodeIndexStart, uint32_t NodeIndex) {
+			auto& VDBParams = VDBData->VDBParams;
+
+			VDBNode		 Node;
+			BrickSortKey BSKey = BrickSortKeys[NodeIndexStart + NodeIndex];
+			Node.Coord =
+				CoordType(BSKey.LevelPosition.X, BSKey.LevelPosition.Y, BSKey.LevelPosition.Z);
+
+			if (Level == 0)
+			{
+				uint32_t BrickIndexWithFrame = FrameIndex * BrickNum + Node.Coord.z * BrickYxX
+					+ Node.Coord.y * VDBParams.BrickPerVolume.x + Node.Coord.x;
+				Node.CoordInAtlas =
+					IndexToCoord(BrickWithFrameToAtlasBrick[BrickIndexWithFrame], BrickPerAtlas);
+			}
+			else
+			{
+				int32_t ChildCurrLev = VDBParams.ChildPerLevels[Level];
+				Node.ChildListOffset =
+					static_cast<uint64_t>(NodeIndex) * ChildCurrLev * ChildCurrLev * ChildCurrLev;
+			}
+
+			VDBData->Node(Level, NodeIndex) = Node;
+		};
+
+		uint64_t NodeIndexStart = 0;
+		for (int32_t Lev = 0; Lev < VDBParams.RootLevel; ++Lev)
+		{
+			thrust::for_each(thrust::cuda::par_nosync.on(getStream(EStream::VDB)),
+				thrust::make_counting_iterator(uint32_t(0)),
+				thrust::make_counting_iterator(static_cast<uint32_t>(dNodePerLevels[Lev].size())),
+				[Lev, NodeIndexStart, AssignNodePoolsKernel] __device__(
+					uint32_t NodeIndex) { AssignNodePoolsKernel(Lev, NodeIndexStart, NodeIndex); });
+			NodeIndexStart += dNodePerLevels[Lev].size();
+		}
+		{
+			VDBNode Root = VDBNode::CreateInvalid();
+			Root.Coord = CoordType(0, 0, 0);
+			Root.ChildListOffset = 0;
+			dNodePerLevels[VDBParams.RootLevel][0] = Root;
+		}
+
+		auto AssignChildPoolsKernel = [BrickYxX, VDBData = dVDBData] __device__(
+										  int32_t Level, uint32_t NodeIndex) {
+			auto&	  VDBParams = VDBData->VDBParams;
+			CoordType Coord = VDBData->Node(Level, NodeIndex).Coord;
+
+			int32_t	  ParentLevel = VDBParams.RootLevel;
+			VDBNode	  Parent = VDBData->Node(ParentLevel, 0);
+			CoordType ChildCoordInParent = VDBData->MapCoord(ParentLevel - 1, Level, Coord);
+			uint32_t  ChildIndexInParent =
+				VDBData->ChildIndexInParent(ParentLevel, ChildCoordInParent);
+			while (ParentLevel != Level + 1)
+			{
+				Parent = VDBData->Node(
+					ParentLevel - 1, VDBData->Child(ParentLevel, ChildIndexInParent, Parent));
+				--ParentLevel;
+				ChildCoordInParent = VDBData->MapCoord(ParentLevel - 1, Level, Coord)
+					- Parent.Coord * VDBParams.ChildPerLevels[ParentLevel];
+				ChildIndexInParent = VDBData->ChildIndexInParent(ParentLevel, ChildCoordInParent);
+			}
+
+			VDBData->Child(ParentLevel, ChildIndexInParent, Parent) = NodeIndex;
+		};
+
+		for (int32_t Lev = VDBParams.RootLevel - 1; Lev >= 0; --Lev)
+		{
+			thrust::for_each(thrust::cuda::par_nosync.on(getStream(EStream::VDB)),
+				thrust::make_counting_iterator(uint32_t(0)),
+				thrust::make_counting_iterator(static_cast<uint32_t>(dNodePerLevels[Lev].size())),
+				[Lev, AssignChildPoolsKernel] __device__(
+					uint32_t NodeIndex) { AssignChildPoolsKernel(Lev, NodeIndex); });
+		}
+
+#ifdef DEPTHBOX_DEBUG
+		CUDA_CHECK(cudaStreamSynchronize(getStream(EStream::VDB)));
+
+		for (int32_t Lev = VDBParams.RootLevel; Lev >= 0; --Lev)
+		{
+			std::cout << std::format("Lev: {}\n", Lev);
+			CUDA_DEBUG_IN_CPU(dNodePerLevels[Lev]);
+			if (Lev > 0)
+			{
+				CUDA_DEBUG_IN_CPU(dChildPerLevels[Lev - 1]);
+			}
+		}
+#endif
+	}
+
+	RsdDataPF.Record(ResidentDataPerFrame::EEvent::BuildVDB, getStream(EStream::VDB));
 }

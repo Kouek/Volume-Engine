@@ -50,7 +50,15 @@ DepthBoxVDB::D3D12::RendererSharedStates::RendererSharedStates()
 	CUDA_CHECK(cudaGetDeviceProperties(&Prop, 0));
 	D3D12NodeMask = Prop.luidDeviceNodeMask;
 
-	CUDA_CHECK(cudaStreamCreate(&Stream));
+	CUDA_CHECK(cudaStreamCreateWithFlags(&Stream, cudaStreamNonBlocking));
+}
+
+DepthBoxVDB::D3D12::RendererSharedStates::~RendererSharedStates()
+{
+	if (Stream != 0)
+	{
+		CUDA_CHECK(cudaStreamDestroy(Stream));
+	}
 }
 
 DepthBoxVDB::VolRenderer::Renderer::Renderer(const CreateParameters& Params)

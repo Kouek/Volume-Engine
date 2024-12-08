@@ -25,6 +25,7 @@ TOptional<FString> FVolDataVDBParameters::InitializeAndCheck(
 		CHECK(LogChildPerLevels[i], 2, kMaxLogChildPerLevel);
 	}
 	CHECK(MaxAllowedGPUMemoryInGB, 1, 64);
+	CHECK(MaxAllowedResidentFrameNum, 1, 6);
 
 #undef CHECK
 
@@ -91,7 +92,7 @@ FVolDataVDBParameters::operator DepthBoxVDB::VolData::VDBParameters()
 
 #define ASSIGN(Member) Ret.Member = Member
 
-	Ret.VoxelType = (DepthBoxVDB::VolData::EVoxelType)(uint8)VoxelType;
+	Ret.VoxelType = (DepthBoxVDB::EVoxelType)(uint8)VoxelType;
 	ASSIGN(RootLevel);
 	ASSIGN(ApronWidth);
 	ASSIGN(ApronAndDepthWidth);
@@ -412,6 +413,7 @@ void UVolDataVDBComponent::buildVDB(bool bNeedReload, bool bNeedRelayoutAtlas)
 				.EmptyScalarRanges = CPUData->EmptyScalarRanges.GetData(),
 				.EmptyScalarRangeNum = CPUData->EmptyScalarRangeNum,
 				.MaxAllowedGPUMemoryInGB = VDBParams.MaxAllowedGPUMemoryInGB,
+				.MaxAllowedResidentFrameNum = VDBParams.MaxAllowedResidentFrameNum,
 				.VDBParams = VDBParams });
 		});
 	}

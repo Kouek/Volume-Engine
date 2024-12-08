@@ -26,6 +26,7 @@ namespace DepthBoxVDB
 
 		private:
 			RendererSharedStates();
+			~RendererSharedStates();
 
 		public:
 			UINT		 D3D12NodeMask;

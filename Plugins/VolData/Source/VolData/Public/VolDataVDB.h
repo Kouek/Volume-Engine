@@ -57,6 +57,8 @@ struct FVolDataVDBParameters
 	FIntVector BrickPerVolume = { 0, 0, 0 };
 	UPROPERTY(EditAnywhere)
 	uint32 MaxAllowedGPUMemoryInGB = 2;
+	UPROPERTY(EditAnywhere)
+	uint32 MaxAllowedResidentFrameNum = 2;
 	UPROPERTY(VisibleAnywhere)
 	FIntVector InitialVoxelPerAtlas{ 0, 0, 0 };
 	UPROPERTY(VisibleAnywhere)
