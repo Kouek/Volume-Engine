@@ -69,6 +69,13 @@ void AVolRendererVDBActor::PostEditChangeProperty(FPropertyChangedEvent& Propert
 		setupRenderer();
 	}
 
+	if (PropertyChangedEvent.GetMemberPropertyName()
+		== GET_MEMBER_NAME_CHECKED(AVolRendererVDBActor, CurrentFrameIndex))
+	{
+		VolRenderer::FStdOutputLinker Linker;
+		VDBComponent->GetVDB()->SwitchToFrame(CurrentFrameIndex);
+	}
+
 	if (PropertyChangedEvent.GetMemberPropertyName() == GET_MEMBER_NAME_CHECKED(AVolRendererVDBActor, TetrahedralActor))
 	{
 		if (TetrahedralActor)

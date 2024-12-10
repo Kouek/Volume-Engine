@@ -6,7 +6,7 @@
 #include <memory>
 
 #include <array>
-#include <queue>
+#include <list>
 #include <unordered_map>
 
 #include <thrust/device_vector.h>
@@ -114,11 +114,116 @@ namespace DepthBoxVDB
 		class VDB : public IVDB
 		{
 		public:
+			struct DataPerFrame
+			{
+				bool								bUpdatedFromEmptyScalarRanges = false;
+				bool								bTransferredToCPU = false;
+				std::vector<uint8_t>				BrickedData;
+				std::vector<BrickSortKey>			BrickSortKeys;
+				thrust::device_vector<BrickSortKey> dBrickSortKeys;
+			};
+
+			struct ResidentDataPerFrame
+			{
+				enum class EEvent
+				{
+					TransferBrickDataToAtlas = 0,
+					UpdateDepthBox,
+					TransferBrickDataToCPU,
+					BuildVDB,
+					Max
+				};
+				std::array<cudaEvent_t, static_cast<uint32_t>(EEvent::Max)> Events;
+				uint32_t													FrameIndex;
+				std::list<uint32_t>::iterator								ResidentIndicesItr;
+
+				VDBData* dVDBData = nullptr;
+				std::array<thrust::device_vector<VDBNode>, VDBParameters::kMaxLevelNum>
+					dNodePerLevels;
+				std::array<thrust::device_vector<uint32_t>, VDBParameters::kMaxLevelNum>
+					dChildPerLevels;
+
+				std::unordered_map<uint32_t, uint32_t> BrickWithFrameToAtlasBrick;
+
+				ResidentDataPerFrame()
+				{
+					Invalidate();
+
+					CUDA_CHECK(cudaMalloc(&dVDBData, sizeof(VDBData)));
+
+					for (int32_t EventIndex = 0; EventIndex < static_cast<int32_t>(EEvent::Max);
+						 ++EventIndex)
+					{
+						CUDA_CHECK(cudaEventCreate(&Events[EventIndex]));
+					}
+				}
+				~ResidentDataPerFrame()
+				{
+					if (dVDBData)
+					{
+						CUDA_CHECK(cudaFree(dVDBData));
+					}
+
+					for (int32_t EventIndex = 0; EventIndex < static_cast<int32_t>(EEvent::Max);
+						 ++EventIndex)
+					{
+						if (Events[EventIndex] == 0)
+							continue;
+						CUDA_CHECK(cudaEventDestroy(Events[EventIndex]));
+					}
+				}
+				ResidentDataPerFrame(const ResidentDataPerFrame&) = delete;
+				ResidentDataPerFrame& operator=(const ResidentDataPerFrame&) = delete;
+				ResidentDataPerFrame(ResidentDataPerFrame&& Other) { operator=(std::move(Other)); }
+				ResidentDataPerFrame& operator=(ResidentDataPerFrame&& Other)
+				{
+					Events = Other.Events;
+					for (int32_t EventIndex = 0; EventIndex < static_cast<int32_t>(EEvent::Max);
+						 ++EventIndex)
+					{
+						Other.Events[EventIndex] = 0;
+					}
+					FrameIndex = Other.FrameIndex;
+
+					dVDBData = Other.dVDBData;
+					Other.dVDBData = nullptr;
+					dNodePerLevels = std::move(Other.dNodePerLevels);
+					dChildPerLevels = std::move(Other.dChildPerLevels);
+
+					BrickWithFrameToAtlasBrick = std::move(Other.BrickWithFrameToAtlasBrick);
+
+					return *this;
+				}
+
+				void Invalidate()
+				{
+					FrameIndex = kInvalidIndex;
+
+					BrickWithFrameToAtlasBrick.clear();
+
+					for (auto& dNodePerLevel : dNodePerLevels)
+						dNodePerLevel.clear();
+					for (auto& dChildPerLevel : dChildPerLevels)
+						dChildPerLevel.clear();
+				}
+
+				cudaEvent_t GetEvent(EEvent Event) { return Events[static_cast<uint32_t>(Event)]; }
+				cudaError_t Record(EEvent Event, cudaStream_t Stream)
+				{
+					return CUDA_CHECK(cudaEventRecord(GetEvent(Event), Stream));
+				}
+				cudaError_t Wait(cudaStream_t Stream, EEvent Event)
+				{
+					return CUDA_CHECK(cudaStreamWaitEvent(Stream, GetEvent(Event)));
+				}
+			};
+
 			struct PopupFrameParameters
 			{
-				DepthBoxVDB::VolData::VDBData** Src = nullptr;
-				DepthBoxVDB::VolData::VDBData** Dst = nullptr;
+				VDB*						OutVDB;
+				const ResidentDataPerFrame* InRsdDataPF;
 			};
+			static void Popup(void* Params);
 
 			VDB(const CreateParameters& Params);
 			~VDB();
@@ -129,7 +234,8 @@ namespace DepthBoxVDB
 			void AppendFrame(const AppendFrameParameters& Params) override;
 			void EndAppendFrame();
 
-			uint32_t GetFrameNum() { return DataPerFrames.size(); }
+			uint32_t GetFrameNum() override { return DataPerFrames.size(); }
+			uint32_t GetMaxResidentFrameNum() override { return MaxResidentFrameNum; }
 			void	 SwitchToFrame(uint32_t FrameIndex) override;
 
 			void UpdateDepthBox(const UpdateDepthBoxParameters& Params) override;
@@ -165,6 +271,11 @@ namespace DepthBoxVDB
 			void							   buildVDB(uint32_t ResidentIndex);
 
 		private:
+			void switchToFrame(uint32_t FrameIndex);
+			void invalidate();
+			void waitForAllStream();
+
+		private:
 			enum class EStream
 			{
 				Copy = 0,
@@ -179,107 +290,16 @@ namespace DepthBoxVDB
 			}
 
 		private:
-			struct DataPerFrame
-			{
-				bool								bUpdatedFromEmptyScalarRanges = false;
-				bool								bTransferredToCPU = false;
-				std::vector<uint8_t>				BrickedData;
-				std::vector<BrickSortKey>			BrickSortKeys;
-				thrust::device_vector<BrickSortKey> dBrickSortKeys;
-			};
-			struct ResidentDataPerFrame
-			{
-				enum class EEvent
-				{
-					TransferBrickDataToAtlas = 0,
-					UpdateDepthBox,
-					TransferBrickDataToCPU,
-					BuildVDB,
-					Max
-				};
-				std::array<cudaEvent_t, static_cast<uint32_t>(EEvent::Max)> Events;
-				uint32_t													FrameIndex;
+			size_t	 MaxAllowedGPUMemoryInByte = 0;
+			uint32_t MaxAllowedResidentFrameNum = 0;
 
-				VDBData* dVDBData = nullptr;
-				std::array<thrust::device_vector<VDBNode>, VDBParameters::kMaxLevelNum>
-					dNodePerLevels;
-				std::array<thrust::device_vector<uint32_t>, VDBParameters::kMaxLevelNum>
-					dChildPerLevels;
-
-				std::unordered_map<uint32_t, uint32_t> BrickWithFrameToAtlasBrick;
-
-				ResidentDataPerFrame()
-				{
-					CUDA_CHECK(cudaMalloc(&dVDBData, sizeof(VDBData)));
-
-					for (int32_t EventIndex = 0; EventIndex < static_cast<int32_t>(EEvent::Max);
-						 ++EventIndex)
-					{
-						CUDA_CHECK(cudaEventCreate(&Events[EventIndex]));
-					}
-				}
-				~ResidentDataPerFrame()
-				{
-					if (dVDBData)
-					{
-						CUDA_CHECK(cudaFree(dVDBData));
-					}
-
-					for (int32_t EventIndex = 0; EventIndex < static_cast<int32_t>(EEvent::Max);
-						 ++EventIndex)
-					{
-						if (Events[EventIndex] == 0)
-							continue;
-						CUDA_CHECK(cudaEventDestroy(Events[EventIndex]));
-					}
-				}
-				ResidentDataPerFrame(const ResidentDataPerFrame&) = delete;
-				ResidentDataPerFrame& operator=(const ResidentDataPerFrame&) = delete;
-				ResidentDataPerFrame(ResidentDataPerFrame&& Other) { operator=(std::move(Other)); }
-				ResidentDataPerFrame& operator=(ResidentDataPerFrame&& Other)
-				{
-					Events = Other.Events;
-					FrameIndex = Other.FrameIndex;
-					dNodePerLevels = std::move(Other.dNodePerLevels);
-					dChildPerLevels = std::move(Other.dChildPerLevels);
-
-					return *this;
-				}
-
-				void Invalidate()
-				{
-					FrameIndex = kInvalidIndex;
-
-					BrickWithFrameToAtlasBrick.clear();
-
-					for (auto& dNodePerLevel : dNodePerLevels)
-						dNodePerLevel.clear();
-					for (auto& dChildPerLevel : dChildPerLevels)
-						dChildPerLevel.clear();
-				}
-
-				cudaEvent_t GetEvent(EEvent Event) { return Events[static_cast<uint32_t>(Event)]; }
-				cudaError_t Record(EEvent Event, cudaStream_t Stream)
-				{
-					return CUDA_CHECK(cudaEventRecord(GetEvent(Event), Stream));
-				}
-				cudaError_t Wait(cudaStream_t Stream, EEvent Event)
-				{
-					return CUDA_CHECK(cudaStreamWaitEvent(Stream, GetEvent(Event)));
-				}
-			};
-
-			size_t	  MaxAllowedGPUMemoryInByte = 0;
-			uint32_t  MaxAllowedResidentFrameNum = 0;
-			uint32_t  MaxResidentFrameNum = 0;
-			uint32_t  ResidentFrameNum = 0;
-			CoordType BrickPerAtlas;
-
-			std::array<cudaStream_t, static_cast<uint32_t>(EStream::Max)> Streams;
-
-			VDBData*			 dVDBDataCurrentFrame = nullptr;
+			uint32_t			 MaxResidentFrameNum;
+			CoordType			 BrickPerAtlas;
+			VDBData*			 dVDBDataCurrentFrame;
 			VDBParameters		 VDBParams;
 			PopupFrameParameters PopupFrameParams;
+
+			std::array<cudaStream_t, static_cast<uint32_t>(EStream::Max)> Streams;
 
 			std::shared_ptr<CUDA::Array>   AtlasArray;
 			std::unique_ptr<CUDA::Texture> AtlasTexture;
@@ -299,7 +319,7 @@ namespace DepthBoxVDB
 			 *    == 1st, 2nd, ..., MaxResidentFrameNum-th playing frames
 			 */
 			std::vector<ResidentDataPerFrame> ResidentDataPerFrames;
-			std::deque<uint32_t>			  ResidentIndices;
+			std::list<uint32_t>				  ResidentIndices;
 
 			std::vector<uint32_t>			AvailableAtlasBrick;
 			std::vector<uint32_t>			AtlasBrickToBrickWithFrame;

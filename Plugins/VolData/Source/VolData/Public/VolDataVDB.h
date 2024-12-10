@@ -60,7 +60,7 @@ struct FVolDataVDBParameters
 	UPROPERTY(EditAnywhere)
 	uint32 MaxAllowedResidentFrameNum = 2;
 	UPROPERTY(VisibleAnywhere)
-	FIntVector InitialVoxelPerAtlas{ 0, 0, 0 };
+	uint32 MaxResidentFrameNum = 0;
 	UPROPERTY(VisibleAnywhere)
 	FIntVector VoxelPerVolume{ 0, 0, 0 };
 
@@ -83,7 +83,9 @@ struct FVolDataLoadRAWVolumeParameters
 	UPROPERTY(EditAnywhere)
 	FIntVector VoxelPerVolume = { 256, 256, 256 };
 	UPROPERTY(VisibleAnywhere)
-	FFilePath SourcePath;
+	TArray<FFilePath> SourcePaths;
+	UPROPERTY(VisibleAnywhere, Transient)
+	uint32 ValidFrameNum = 0;
 };
 
 USTRUCT()
@@ -97,7 +99,7 @@ struct FVolDataLoadTransferFunctionParameters
 	bool bNeedFullRebuild = true;
 	UPROPERTY(VisibleAnywhere)
 	uint32 Resolution = 256;
-	UPROPERTY(EditAnywhere)
+	UPROPERTY(VisibleAnywhere)
 	float MaxScalarInTF = 0.f;
 	UPROPERTY(VisibleAnywhere)
 	FFilePath SourcePath;
@@ -120,14 +122,14 @@ public:
 	UPROPERTY(VisibleAnywhere, Transient, Category = "VolData")
 	TObjectPtr<UCurveLinearColor> TransferFunctionCurve = nullptr;
 
-	UPROPERTY(EditAnywhere, Category = "VolData", DisplayName = "Load RAW Vol")
+	UPROPERTY(EditAnywhere, Category = "VolData")
 	FVolDataLoadRAWVolumeParameters LoadRAWVolumeParams;
-	UFUNCTION(CallInEditor, Category = "VolData")
+	UFUNCTION(CallInEditor, Category = "VolData", DisplayName = "Load RAW Volume(s)")
 	void LoadRAWVolume();
 
-	UPROPERTY(EditAnywhere, Category = "VolData", DisplayName = "Load TF")
+	UPROPERTY(EditAnywhere, Category = "VolData")
 	FVolDataLoadTransferFunctionParameters LoadTransferFunctionParameters;
-	UFUNCTION(CallInEditor, Category = "VolData")
+	UFUNCTION(CallInEditor, Category = "VolData", DisplayName = "Load TF")
 	void LoadTransferFunction();
 
 	UFUNCTION(CallInEditor, Category = "VolData", DisplayName = "Full Rebuild VDB")
@@ -147,7 +149,7 @@ public:
 #endif
 
 private:
-	void loadRAWVolume();
+	bool loadRAWVolume(int32 FrameIndex);
 	void loadTransferFunction();
 	void syncTransferFunctionFromCurve();
 	void buildVDB(bool bNeedReload = false, bool bNeedRelayoutAtlas = false);

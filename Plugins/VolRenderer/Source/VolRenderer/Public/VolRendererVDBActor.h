@@ -19,6 +19,8 @@ public:
 	UPROPERTY(VisibleAnywhere, Category = "VolRenderer", DisplayName = "VDB")
 	TObjectPtr<UVolDataVDBComponent> VDBComponent;
 
+	UPROPERTY(EditAnywhere, Transient, Category = "VolDeform")
+	int32 CurrentFrameIndex = 0;
 	UPROPERTY(EditAnywhere, Category = "VolDeform")
 	TObjectPtr<AVolDeformTetrahedralActor> TetrahedralActor;
 

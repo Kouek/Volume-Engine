@@ -1,11 +1,5 @@
 #include "VolRenderer.h"
 
-DepthBoxVDB::D3D12::RendererSharedStates& DepthBoxVDB::D3D12::RendererSharedStates::Instance()
-{
-	static DepthBoxVDB::D3D12::RendererSharedStates State;
-	return State;
-}
-
 void DepthBoxVDB::D3D12::RendererSharedStates::Register(void* Device, void* ExternalTexture)
 {
 	if (!ExternalTexture)
@@ -57,6 +51,7 @@ DepthBoxVDB::D3D12::RendererSharedStates::~RendererSharedStates()
 {
 	if (Stream != 0)
 	{
+		CUDA_CHECK(cudaStreamSynchronize(Stream));
 		CUDA_CHECK(cudaStreamDestroy(Stream));
 	}
 }
@@ -67,7 +62,7 @@ DepthBoxVDB::VolRenderer::Renderer::Renderer(const CreateParameters& Params)
 	switch (RHIType)
 	{
 		case ERHIType::D3D12:
-			Stream = D3D12::RendererSharedStates::Instance().Stream;
+			RendererSharedStates = std::make_shared<D3D12::RendererSharedStates>();
 			break;
 		default:
 			assert(false);
@@ -82,7 +77,7 @@ void DepthBoxVDB::VolRenderer::Renderer::Register(const RegisterParameters& Para
 	{
 		case DepthBoxVDB::VolRenderer::ERHIType::D3D12:
 			for (auto ExternalTexture : { Params.InSceneDepthTexture, Params.InOutColorTexture })
-				D3D12::RendererSharedStates::Instance().Register(Params.Device, ExternalTexture);
+				RendererSharedStates->Register(Params.Device, ExternalTexture);
 			break;
 		default:
 			assert(false);
@@ -90,7 +85,7 @@ void DepthBoxVDB::VolRenderer::Renderer::Register(const RegisterParameters& Para
 
 	auto FindAndSet = [&](std::shared_ptr<D3D12::TextureMappedCUDASurface>& Dest,
 						  void*												ExternalTexture) {
-		auto& Map = D3D12::RendererSharedStates::Instance().ExternalToRegisteredTextures;
+		auto& Map = RendererSharedStates->ExternalToRegisteredTextures;
 		auto  Itr = Map.find(ExternalTexture);
 		if (Itr == Map.end())
 		{
@@ -120,7 +115,7 @@ void DepthBoxVDB::VolRenderer::Renderer::Unregister()
 	{
 		case DepthBoxVDB::VolRenderer::ERHIType::D3D12:
 			for (auto ExternalTexture : { InSceneDepthTexture.get(), InOutColorTexture.get() })
-				D3D12::RendererSharedStates::Instance().Unregister(ExternalTexture);
+				RendererSharedStates->Unregister(ExternalTexture);
 			break;
 		default:
 			assert(false);

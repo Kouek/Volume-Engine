@@ -16,15 +16,12 @@ namespace DepthBoxVDB
 	namespace D3D12
 	{
 
-		class RendererSharedStates
+		class RendererSharedStates : Noncopyable
 		{
 		public:
-			static RendererSharedStates& Instance();
-
 			void Register(void* Device, void* ExternalTexture);
 			void Unregister(void* RegisteredTexture);
 
-		private:
 			RendererSharedStates();
 			~RendererSharedStates();
 
@@ -65,6 +62,7 @@ namespace DepthBoxVDB
 			bool	   bUsePreIntegratedTF = false;
 			glm::uvec2 RenderResolution;
 
+			std::shared_ptr<D3D12::RendererSharedStates>	 RendererSharedStates;
 			std::shared_ptr<D3D12::TextureMappedCUDASurface> InSceneDepthTexture;
 			std::shared_ptr<D3D12::TextureMappedCUDASurface> InOutColorTexture;
 			std::unique_ptr<CUDA::Texture>					 TransferFunctionTexture;

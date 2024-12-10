@@ -164,6 +164,7 @@ namespace DepthBoxVDB
 			virtual void EndAppendFrame() = 0;
 
 			virtual uint32_t GetFrameNum() = 0;
+			virtual uint32_t GetMaxResidentFrameNum() = 0;
 			virtual void	 SwitchToFrame(uint32_t FrameIndex) = 0;
 
 			struct UpdateDepthBoxParameters

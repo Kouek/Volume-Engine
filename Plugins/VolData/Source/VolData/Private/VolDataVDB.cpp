@@ -65,24 +65,6 @@ TOptional<FString> FVolDataVDBParameters::InitializeAndCheck(
 		BrickPerVolume[Axis] = (VoxelPerVolume[Axis] + ChildPerLevels[0] - 1) / ChildPerLevels[0];
 	}
 
-	InitialVoxelPerAtlas = BrickPerVolume * VoxelPerAtlasBrick;
-	{
-		size_t VoxelSize = VolData::SizeOfVoxelType(VoxelType);
-		size_t MaxAllowedGPUMemoryInByte = VoxelSize * MaxAllowedGPUMemoryInGB * (1 << 30);
-		while ([&]() {
-			return InitialVoxelPerAtlas.Z > 0
-				&& VoxelSize * InitialVoxelPerAtlas.X * InitialVoxelPerAtlas.Y * InitialVoxelPerAtlas.Z
-				> MaxAllowedGPUMemoryInByte;
-		}())
-			InitialVoxelPerAtlas.Z -= VoxelPerAtlasBrick;
-	}
-
-	if (InitialVoxelPerAtlas.Z == 0)
-	{
-		return FString(
-			TEXT("MaxAllowedGPUMemoryInGB is too small. VoxelPerAtlas.x * VoxelPerAtlas.y cannot be contained."));
-	}
-
 	return {};
 }
 
@@ -176,13 +158,18 @@ void UVolDataVDBComponent::LoadRAWVolume()
 {
 	FJsonSerializableArray Files;
 	FDesktopPlatformModule::Get()->OpenFileDialog(
-		FSlateApplication::Get().FindBestParentWindowHandleForDialogs(nullptr), TEXT("Select a RAW Volume file"),
-		FPaths::GetProjectFilePath(), TEXT(""), TEXT("Volume|*.raw;*.bin;*.RAW"), EFileDialogFlags::None, Files);
+		FSlateApplication::Get().FindBestParentWindowHandleForDialogs(nullptr), TEXT("Select RAW Volume file(s)"),
+		FPaths::GetProjectFilePath(), TEXT(""), TEXT("Volume|*.raw;*.bin;*.RAW"), EFileDialogFlags::Multiple, Files);
 	if (Files.IsEmpty())
 		return;
 
-	LoadRAWVolumeParams.SourcePath.FilePath = Files[0];
+	LoadRAWVolumeParams.SourcePaths.Empty();
+	for (int32 i = 0; i < Files.Num(); ++i)
+	{
+		LoadRAWVolumeParams.SourcePaths.Add(FFilePath{ Files[i] });
+	}
 	LoadRAWVolumeParams.bNeedReload = true;
+	LoadRAWVolumeParams.ValidFrameNum = 0;
 
 	buildVDB();
 }
@@ -225,6 +212,13 @@ void UVolDataVDBComponent::PostEditChangeProperty(FPropertyChangedEvent& Propert
 		{
 			buildVDB(false, VDBParams.LogChildAtLevelZeroCached != VDBParams.LogChildPerLevels[0]);
 		}
+		else if (PropertyChangedEvent.GetPropertyName()
+				== GET_MEMBER_NAME_CHECKED(FVolDataVDBParameters, MaxAllowedGPUMemoryInGB)
+			|| PropertyChangedEvent.GetPropertyName()
+				== GET_MEMBER_NAME_CHECKED(FVolDataVDBParameters, MaxAllowedResidentFrameNum))
+		{
+			buildVDB(false, true);
+		}
 		else
 		{
 			buildVDB();
@@ -233,26 +227,39 @@ void UVolDataVDBComponent::PostEditChangeProperty(FPropertyChangedEvent& Propert
 }
 #endif
 
-void UVolDataVDBComponent::loadRAWVolume()
+bool UVolDataVDBComponent::loadRAWVolume(int32 FrameIndex)
 {
 	// Temporarily support RAW Volume only
 	CPUData->RAWVolumeData.Empty();
 
+	if (FrameIndex >= LoadRAWVolumeParams.SourcePaths.Num())
+	{
+		UE_LOG(LogVolData, Error, TEXT("Frame Index: %d >= selected RAW Volume Files num: %d"), FrameIndex,
+			LoadRAWVolumeParams.SourcePaths.Num());
+		return false;
+	}
+
 	auto DataOrErrMsg = FVolDataRAWVolumeData::LoadFromFile({ .VoxelType = LoadRAWVolumeParams.VoxelType,
 		.VoxelPerVolume = LoadRAWVolumeParams.VoxelPerVolume,
 		.AxisOrder = LoadRAWVolumeParams.AxisOrder,
-		.SourcePath = LoadRAWVolumeParams.SourcePath });
+		.SourcePath = LoadRAWVolumeParams.SourcePaths[FrameIndex] });
 	if (DataOrErrMsg.IsType<FString>())
 	{
 		UE_LOG(LogVolData, Error, TEXT("%s"), *DataOrErrMsg.Get<FString>());
-		return;
+		return false;
 	}
 
 	CPUData->RAWVolumeData = std::move(DataOrErrMsg.Get<TArray<uint8>>());
-	CPUData->VoxelPerVolume =
-		VolData::ReorderVoxelPerVolume(LoadRAWVolumeParams.VoxelPerVolume, LoadRAWVolumeParams.AxisOrder)
-			.GetValue()
-			.Get<1>();
+	if (LoadRAWVolumeParams.ValidFrameNum == 0)
+	{
+		CPUData->VoxelPerVolume =
+			VolData::ReorderVoxelPerVolume(LoadRAWVolumeParams.VoxelPerVolume, LoadRAWVolumeParams.AxisOrder)
+				.GetValue()
+				.Get<1>();
+	}
+	++LoadRAWVolumeParams.ValidFrameNum;
+
+	return true;
 }
 
 void UVolDataVDBComponent::loadTransferFunction()
@@ -301,9 +308,10 @@ void UVolDataVDBComponent::loadTransferFunction()
 				EmptyRange[0] = std::min(Scalar, EmptyRange[0]);
 				EmptyRange[1] = std::max(Scalar, EmptyRange[1]);
 			}
-			else if (EmptyRange[0] < EmptyRange[1])
+			else
 			{
-				Append();
+				if (EmptyRange[0] < EmptyRange[1])
+					Append();
 				EmptyRange[0] = LoadTransferFunctionParameters.MaxScalarInTF;
 				EmptyRange[1] = 0;
 			}
@@ -373,13 +381,6 @@ void UVolDataVDBComponent::syncTransferFunctionFromCurve()
 void UVolDataVDBComponent::buildVDB(bool bNeedReload, bool bNeedRelayoutAtlas)
 {
 	bool bNeedFullRebuild = bNeedRelayoutAtlas;
-	if (bNeedReload || LoadRAWVolumeParams.bNeedReload)
-	{
-		loadRAWVolume();
-
-		LoadRAWVolumeParams.bNeedReload = false;
-		bNeedFullRebuild = true;
-	}
 
 	if (bNeedReload || LoadTransferFunctionParameters.bNeedReload)
 	{
@@ -390,31 +391,54 @@ void UVolDataVDBComponent::buildVDB(bool bNeedReload, bool bNeedRelayoutAtlas)
 		bNeedFullRebuild |= LoadTransferFunctionParameters.bNeedFullRebuild;
 	}
 
-	if (!CPUData->IsComplete())
-	{
-		UE_LOG(LogVolData, Error, TEXT("CPUData is incomplete, cannot perform VDB Building."));
-		return;
-	}
-
-	{
-		auto ErrMsgOpt = VDBParams.InitializeAndCheck(CPUData->VoxelPerVolume, LoadRAWVolumeParams.VoxelType);
-		if (ErrMsgOpt.IsSet())
+	AsyncTask(ENamedThreads::Type::AnyThread, [this, bNeedReload, bNeedFullRebuild]() mutable {
+		if (bNeedReload || LoadRAWVolumeParams.bNeedReload)
 		{
-			UE_LOG(LogVolData, Error, TEXT("%s"), *ErrMsgOpt.GetValue());
+			loadRAWVolume(0);
+
+			LoadRAWVolumeParams.bNeedReload = false;
+			bNeedFullRebuild = true;
+		}
+
+		if (!CPUData->IsComplete())
+		{
+			UE_LOG(LogVolData, Error, TEXT("CPUData is incomplete, cannot perform VDB Building."));
 			return;
 		}
-	}
 
-	if (bNeedFullRebuild)
-	{
-		AsyncTask(ENamedThreads::Type::ActualRenderingThread, [this]() {
+		{
+			auto ErrMsgOpt = VDBParams.InitializeAndCheck(CPUData->VoxelPerVolume, LoadRAWVolumeParams.VoxelType);
+			if (ErrMsgOpt.IsSet())
+			{
+				UE_LOG(LogVolData, Error, TEXT("%s"), *ErrMsgOpt.GetValue());
+				return;
+			}
+		}
+
+		if (bNeedFullRebuild)
+		{
 			VolData::FStdOutputLinker Linker;
-			VDB->FullBuild({ .RAWVolumeData = CPUData->RAWVolumeData.GetData(),
-				.EmptyScalarRanges = CPUData->EmptyScalarRanges.GetData(),
+			VDB->StartAppendFrame({ .EmptyScalarRanges = CPUData->EmptyScalarRanges.GetData(),
 				.EmptyScalarRangeNum = CPUData->EmptyScalarRangeNum,
 				.MaxAllowedGPUMemoryInGB = VDBParams.MaxAllowedGPUMemoryInGB,
 				.MaxAllowedResidentFrameNum = VDBParams.MaxAllowedResidentFrameNum,
 				.VDBParams = VDBParams });
-		});
-	}
+			VDB->AppendFrame({
+				.RAWVolumeData = CPUData->RAWVolumeData.GetData(),
+			});
+
+			for (int32 FrameIndex = 1; FrameIndex < LoadRAWVolumeParams.SourcePaths.Num(); ++FrameIndex)
+			{
+				if (!loadRAWVolume(FrameIndex))
+					continue;
+
+				VDB->AppendFrame({
+					.RAWVolumeData = CPUData->RAWVolumeData.GetData(),
+				});
+			}
+
+			VDB->EndAppendFrame();
+			VDBParams.MaxResidentFrameNum = VDB->GetMaxResidentFrameNum();
+		}
+	});
 }
