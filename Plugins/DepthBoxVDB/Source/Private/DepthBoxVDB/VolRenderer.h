@@ -26,8 +26,7 @@ namespace DepthBoxVDB
 			~RendererSharedStates();
 
 		public:
-			UINT		 D3D12NodeMask;
-			cudaStream_t Stream = 0;
+			UINT D3D12NodeMask;
 
 			std::unordered_map<void*, std::shared_ptr<TextureMappedCUDASurface>>
 				ExternalToRegisteredTextures;
@@ -54,12 +53,12 @@ namespace DepthBoxVDB
 			void SetTransferFunction(const TransferFunctionParameters& Params) override;
 
 		protected:
-			cudaStream_t Stream = 0;
-			ERHIType	 RHIType;
+			ERHIType RHIType;
 
 			/* Keep only necessary states in CPU */
 			bool	   bUseDepthBox = false;
 			bool	   bUsePreIntegratedTF = false;
+			bool	   bUseShading = false;
 			glm::uvec2 RenderResolution;
 
 			std::shared_ptr<D3D12::RendererSharedStates>	 RendererSharedStates;
@@ -80,6 +79,8 @@ namespace DepthBoxVDB
 				float			 Step;
 				float			 MaxStepDist;
 				float			 MaxAlpha;
+				float			 Ka, Kd, Ks, Shiness;
+				glm::vec3		 VoxelSpaces;
 				glm::vec3		 InvVoxelSpaces;
 				glm::vec3		 VisibleAABBMinPosition;
 				glm::vec3		 VisibleAABBMaxPosition;
@@ -91,7 +92,8 @@ namespace DepthBoxVDB
 			void SetParameters(const RendererParameters& Params) override;
 
 			void Render(const RenderParameters& Params) override;
-			template <typename VoxelType, bool bUseDepthBox, bool bUsePreIntegratedTF>
+			template <typename VoxelType, bool bUseDepthBox, bool bUsePreIntegratedTF,
+				bool bUseShading>
 			void render(const RenderParameters& Params, const VolData::VDBData* dVDBData);
 
 		private:

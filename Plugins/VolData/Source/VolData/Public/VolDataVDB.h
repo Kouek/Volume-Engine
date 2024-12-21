@@ -112,6 +112,20 @@ class VOLDATA_API UVolDataVDBComponent : public USceneComponent
 
 public:
 	UVolDataVDBComponent(const FObjectInitializer&);
+	~UVolDataVDBComponent();
+
+	UPROPERTY(EditAnywhere, Transient, Category = "VolData", DisplayName = "Duration(secs) of one Frame")
+	float FrameDuration = 1.f;
+	UPROPERTY(VisibleAnywhere, Transient, Category = "VolData")
+	int32 CurrentFrameIndex = 0;
+	UPROPERTY(EditAnywhere, Transient, Category = "VolData")
+	int32 NextFrameIndex = 0;
+	UPROPERTY(EditAnywhere, Transient, Category = "VolData")
+	bool bEnablePlayLoop = false;
+	UPROPERTY(VisibleAnywhere, Transient, Category = "VolData")
+	uint64 AtlasGPUMemInByte = 0;
+	UPROPERTY(VisibleAnywhere, Transient, Category = "VolData")
+	uint64 PoolGPUMemInByteForAllFrames = 0;
 
 	UPROPERTY(EditAnywhere, Category = "VolData", DisplayName = "VDB")
 	FVolDataVDBParameters VDBParams;
@@ -136,12 +150,16 @@ public:
 	void FullRebuildVDB();
 
 	void PostLoad() override;
+	void EndPlay(EEndPlayReason::Type Reason) override;
+	void BeginDestroy() override;
 
 	std::shared_ptr<DepthBoxVDB::VolData::IVDB> GetVDB() const { return VDB; }
 	TSharedPtr<FVolDataVDBCPUData>				GetCPUData() const { return CPUData; }
 
-	DECLARE_MULTICAST_DELEGATE_OneParam(FTransferFunctionChanged, UVolDataVDBComponent*);
+	DECLARE_MULTICAST_DELEGATE(FTransferFunctionChanged);
+	DECLARE_MULTICAST_DELEGATE(FVDBChanged);
 
+	FTransferFunctionChanged VDBChanged;
 	FTransferFunctionChanged TransferFunctionChanged;
 
 #if WITH_EDITOR
@@ -152,9 +170,15 @@ private:
 	bool loadRAWVolume(int32 FrameIndex);
 	void loadTransferFunction();
 	void syncTransferFunctionFromCurve();
-	void buildVDB(bool bNeedReload = false, bool bNeedRelayoutAtlas = false);
+	void buildVDB(bool bNeedReload = false, bool bNeedRelayoutAtlas = false, bool bNeedRecacheResidentFrames = false);
+
+	void registerFrameSwitcher();
+	void unregisterFrameSwitcher();
 
 private:
+	FTimerHandle	 FrameSwitcher;
+	FCriticalSection BuildVDBCS;
+
 	TSharedPtr<FVolDataVDBCPUData> CPUData;
 
 	std::shared_ptr<DepthBoxVDB::VolData::IVDB> VDB;

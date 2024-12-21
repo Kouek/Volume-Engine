@@ -19,8 +19,6 @@ public:
 	UPROPERTY(VisibleAnywhere, Category = "VolRenderer", DisplayName = "VDB")
 	TObjectPtr<UVolDataVDBComponent> VDBComponent;
 
-	UPROPERTY(EditAnywhere, Transient, Category = "VolDeform")
-	int32 CurrentFrameIndex = 0;
 	UPROPERTY(EditAnywhere, Category = "VolDeform")
 	TObjectPtr<AVolDeformTetrahedralActor> TetrahedralActor;
 
@@ -28,7 +26,6 @@ public:
 	~AVolRendererVDBActor();
 
 	void PostLoad() override;
-	void Destroyed() override;
 	void BeginPlay() override;
 
 #if WITH_EDITOR
@@ -46,5 +43,11 @@ private:
 private:
 	TSharedPtr<FVolRendererVDBRenderer> VDBRenderer;
 
-	FCriticalSection VDBRendererParamsCS;
+	FCriticalSection ParamsCS;
+
+	FDelegateHandle OnVDBChanged;
+	FDelegateHandle OnTransferFunctionChanged;
+	FDelegateHandle OnTransformUpdated;
+	FDelegateHandle OnRenderSizeChanged_RenderThread;
+	FDelegateHandle OnFrameIndexChanged_RenderThread;
 };

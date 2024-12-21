@@ -32,17 +32,16 @@ namespace DepthBoxVDB
 		{
 			int32_t	  MaxStepNum;
 			bool	  bUsePreIntegratedTF;
+			bool	  bUseShading;
 			bool	  bUseDepthOcclusion;
 			float	  Step;
 			float	  MaxStepDist;
 			float	  MaxAlpha;
+			glm::vec3 VoxelSpaces;
 			glm::vec3 InvVoxelSpaces;
-		};
-
-		struct RAWRendererParameters : RendererParameters
-		{
-			bool bUsePreIntegratedTF;
-			bool bUseDepthOcclusion;
+			float	  Ka, Kd, Ks, Shiness;
+			glm::vec3 LightPosition;
+			glm::vec3 LightRadiance;
 		};
 
 		class IRenderer : Noncopyable
@@ -94,6 +93,8 @@ namespace DepthBoxVDB
 				glm::mat4			 InverseProjection;
 				glm::mat3			 CameraRotationToLocal;
 				glm::vec3			 CameraPositionToVDB;
+				glm::vec3			 LightPositionToLocal;
+				glm::vec3			 LightRadiance;
 				const VolData::IVDB& VDB;
 			};
 			virtual void Render(const RenderParameters& Params) = 0;

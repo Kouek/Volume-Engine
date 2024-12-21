@@ -7,6 +7,8 @@
 
 DECLARE_LOG_CATEGORY_EXTERN(LogVolData, Log, All);
 
+DECLARE_STATS_GROUP(TEXT("DepthBoxVDB"), STATGROUP_DepthBoxVDB, STAT_Advanced);
+
 UENUM()
 enum class EVolDataVoxelType : uint8
 {

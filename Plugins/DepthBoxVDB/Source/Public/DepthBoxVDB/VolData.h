@@ -163,9 +163,25 @@ namespace DepthBoxVDB
 			virtual void AppendFrame(const AppendFrameParameters& Params) = 0;
 			virtual void EndAppendFrame() = 0;
 
-			virtual uint32_t GetFrameNum() = 0;
-			virtual uint32_t GetMaxResidentFrameNum() = 0;
+			struct RecacheResidentFramesParameters
+			{
+				uint32_t MaxAllowedGPUMemoryInGB;
+				uint32_t MaxAllowedResidentFrameNum;
+			};
+			virtual void RecacheResidentFrames(const RecacheResidentFramesParameters& Params) = 0;
+
+			struct Status
+			{
+				size_t AtlasGPUMemInByte;
+				size_t PoolGPUMemInByteForAllFrames;
+			};
+			virtual Status GetStatus() const = 0;
+
+			virtual uint32_t GetFrameIndex() const = 0;
+			virtual uint32_t GetFrameNum() const = 0;
+			virtual uint32_t GetMaxResidentFrameNum() const = 0;
 			virtual void	 SwitchToFrame(uint32_t FrameIndex) = 0;
+			virtual bool	 IsSwitched() const = 0;
 
 			struct UpdateDepthBoxParameters
 			{

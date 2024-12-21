@@ -20,9 +20,10 @@ TOptional<FString> FVolRendererVDBRendererParameters::InitializeAndCheck()
 	CHECK(Step, 0.f, std::numeric_limits<float>::max())
 	CHECK(MaxStepDist, 0.f, std::numeric_limits<float>::max())
 	CHECK(MaxAlpha, .1f, 1.f);
+
 	for (int32 Axis = 0; Axis < 3; ++Axis)
 	{
-		if (FMath::IsNaN(InvVoxelSpaces[Axis]))
+		if (FMath::IsNaN(VoxelSpaces[Axis]) || VoxelSpaces[Axis] <= 0.f)
 		{
 			return FString("Invalid InvVoxelSpaces.");
 		}
@@ -42,14 +43,20 @@ FVolRendererVDBRendererParameters::operator DepthBoxVDB::VolRenderer::IVDBRender
 	Ret.RenderTarget = (DepthBoxVDB::VolRenderer::EVDBRenderTarget)(uint8)RenderTarget;
 	ASSIGN(bUseDepthBox);
 	ASSIGN(bUsePreIntegratedTF);
+	ASSIGN(bUseShading);
 	ASSIGN(bUseDepthOcclusion);
 	ASSIGN(MaxStepNum);
 	ASSIGN(Step);
 	ASSIGN(MaxStepDist);
 	ASSIGN(MaxAlpha);
+	ASSIGN(Ka);
+	ASSIGN(Kd);
+	ASSIGN(Ks);
+	ASSIGN(Shiness);
 
 	for (int32 Axis = 0; Axis < 3; ++Axis)
 	{
+		ASSIGN(VoxelSpaces[Axis]);
 		ASSIGN(InvVoxelSpaces[Axis]);
 	}
 
@@ -359,6 +366,14 @@ void FVolRendererVDBRenderer::Render_RenderThread(FPostOpaqueRenderParameters& P
 				CameraPositionToLoacl, VDBRendererParams.Transform.InverseTransformPositionNoScale(CameraPos));
 		}
 
+		glm::vec3 LightPositionToLocal(0.f);
+		if (VDBRendererParams.Light)
+		{
+			FVector LightPos = VDBRendererParams.Light->GetTransform().GetLocation();
+			AssignLeftHandedToRight(
+				LightPositionToLocal, VDBRendererParams.Transform.InverseTransformPositionNoScale(LightPos));
+		}
+
 		glm::mat3 CameraRotationToLoacl;
 		{
 			FMatrix RotationToLocal = VDBRendererParams.Transform.GetRotation().ToMatrix();
@@ -380,18 +395,24 @@ void FVolRendererVDBRenderer::Render_RenderThread(FPostOpaqueRenderParameters& P
 				 InvProjMatrix.M[2][3], InvProjMatrix.M[3][0], InvProjMatrix.M[3][1], -InvProjMatrix.M[3][2],
 				 InvProjMatrix.M[3][3]);
 
+		glm::vec3 Scale(
+			VDBRendererParams.InvVoxelSpaces.X, VDBRendererParams.InvVoxelSpaces.Y, VDBRendererParams.InvVoxelSpaces.Z);
+
 		GraphBuilder->AddPass(RDG_EVENT_NAME("Volume Rendering"), ShaderParametersMetadata, ShaderParams,
 			ERDGPassFlags::AsyncCompute | ERDGPassFlags::NeverCull,
-			[InverseProjection, CameraRotationToLoacl,
-				CameraPositionToVDB = glm::vec3(VDBRendererParams.InvVoxelSpaces.X, VDBRendererParams.InvVoxelSpaces.Y,
-										  VDBRendererParams.InvVoxelSpaces.Z)
-					* CameraPositionToLoacl,
-				DepthTexture = DepthTexture, VolumeColorTexture = VolumeColorTexture, VDBRenderer = VDBRenderer.get(),
-				VDB = VDB.get()](FRHICommandListImmediate& RHICmdList) {
+			[InverseProjection, CameraRotationToLoacl, CameraPositionToVDB = Scale * CameraPositionToLoacl,
+				LightPositionToLocal, DepthTexture = DepthTexture, VolumeColorTexture = VolumeColorTexture,
+				VDBRenderer = VDBRenderer.get(), VDB = VDB.get()](FRHICommandListImmediate& RHICmdList) {
+				DECLARE_SCOPE_CYCLE_COUNTER(
+					TEXT("DepthBoxVDB/RenderVolume"), STAT_DepthBoxVDB_RenderVolume, STATGROUP_DepthBoxVDB);
+
 				VolRenderer::FStdOutputLinker Linker;
+
 				VDBRenderer->Render({ .InverseProjection = InverseProjection,
 					.CameraRotationToLocal = CameraRotationToLoacl,
 					.CameraPositionToVDB = CameraPositionToVDB,
+					.LightPositionToLocal = LightPositionToLocal,
+					.LightRadiance = glm::vec3(1.f),
 					.VDB = *VDB });
 			});
 	}

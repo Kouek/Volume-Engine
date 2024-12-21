@@ -17,6 +17,8 @@ public:
 	};
 	static TVariant<typename LoadFromFileParameters::RetValueType, FString> LoadFromFile(
 		const LoadFromFileParameters& Params);
+	static TOptional<FString> SaveToFile(
+		const LoadFromFileParameters::RetValueType& Points, const FFilePath& DestinationPath);
 
 	template <bool bUseHalf> struct FlattenDataTrait
 	{

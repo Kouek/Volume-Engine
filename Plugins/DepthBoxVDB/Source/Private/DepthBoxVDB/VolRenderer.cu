@@ -43,18 +43,9 @@ DepthBoxVDB::D3D12::RendererSharedStates::RendererSharedStates()
 	cudaDeviceProp Prop;
 	CUDA_CHECK(cudaGetDeviceProperties(&Prop, 0));
 	D3D12NodeMask = Prop.luidDeviceNodeMask;
-
-	CUDA_CHECK(cudaStreamCreateWithFlags(&Stream, cudaStreamNonBlocking));
 }
 
-DepthBoxVDB::D3D12::RendererSharedStates::~RendererSharedStates()
-{
-	if (Stream != 0)
-	{
-		CUDA_CHECK(cudaStreamSynchronize(Stream));
-		CUDA_CHECK(cudaStreamDestroy(Stream));
-	}
-}
+DepthBoxVDB::D3D12::RendererSharedStates::~RendererSharedStates() {}
 
 DepthBoxVDB::VolRenderer::Renderer::Renderer(const CreateParameters& Params)
 	: RHIType(Params.RHIType)

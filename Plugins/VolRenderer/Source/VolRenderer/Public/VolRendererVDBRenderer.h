@@ -1,12 +1,14 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Engine/Light.h"
 
 #include <atomic>
 
 #include "VolRendererUtil.h"
 #include "VolDataVDB.h"
 
+#include "DepthBoxVDB/VolData.h"
 #include "DepthBoxVDB/VolRenderer.h"
 
 #include "VolRendererVDBRenderer.generated.h"
@@ -57,6 +59,8 @@ struct FVolRendererVDBRendererParameters
 	UPROPERTY(EditAnywhere)
 	bool bUsePreIntegratedTF = true;
 	UPROPERTY(EditAnywhere)
+	bool bUseShading = false;
+	UPROPERTY(EditAnywhere)
 	bool bUseDepthOcclusion = true;
 	UPROPERTY(EditAnywhere)
 	bool bClipByVisibleBox = false;
@@ -71,6 +75,16 @@ struct FVolRendererVDBRendererParameters
 	float MaxStepDist = 3000.f;
 	UPROPERTY(EditAnywhere)
 	float MaxAlpha = .95f;
+	UPROPERTY(EditAnywhere)
+	float Ka = .6f;
+	UPROPERTY(EditAnywhere)
+	float Kd = .4f;
+	UPROPERTY(EditAnywhere)
+	float Ks = .4f;
+	UPROPERTY(EditAnywhere)
+	float Shiness = 128.f;
+	UPROPERTY(VisibleAnywhere)
+	FVector VoxelSpaces = { 1., 1., 1. };
 	UPROPERTY(VisibleAnywhere)
 	FVector InvVoxelSpaces = { 1., 1., 1. };
 	UPROPERTY(VisibleAnywhere)
@@ -80,6 +94,9 @@ struct FVolRendererVDBRendererParameters
 	FVector DeformVolumeOrigin = FVector::ZeroVector;
 
 	FTransform Transform;
+
+	UPROPERTY(EditAnywhere, DisplayName = "Light")
+	TObjectPtr<ALight> Light;
 
 	void ResetVisibleBox()
 	{

@@ -1,7 +1,7 @@
 #include "VolData.h"
 
 #include <algorithm>
-#include <future>
+#include <execution>
 
 #include <thrust/binary_search.h>
 #include <thrust/sort.h>
@@ -35,17 +35,45 @@ DepthBoxVDB::VolData::VDB::VDB(const CreateParameters& Params)
 	cudaDeviceProp Prop;
 	CUDA_CHECK(cudaGetDeviceProperties(&Prop, 0));
 
-	for (uint32_t i = 0; i < static_cast<uint32_t>(EStream::Max); ++i)
+	for (uint32_t i = 0; i < static_cast<uint32_t>(EStream::Num); ++i)
 	{
-		CUDA_CHECK(cudaStreamCreateWithFlags(&Streams[i], cudaStreamNonBlocking));
+		CUDA_CHECK(cudaStreamCreateWithFlags(&Streams[i], kStreamFlags[i]));
 	}
 
 	invalidate();
+
+	SwitchToFrameWorker = std::make_unique<std::thread>([this]() {
+		while (true)
+		{
+			std::unique_lock<std::mutex> Lock(SwitchToFrameTasksMtx);
+			SwitchToFrameTasksCV.wait(Lock,
+				[this]() { return !SwitchToFrameTasks.empty() || !bCanSwitchToFrameWorkerRun; });
+			if (!bCanSwitchToFrameWorkerRun)
+				break;
+
+			uint32_t FrameIndex = SwitchToFrameTasks.back();
+			SwitchToFrameTasks.pop_back();
+
+			Lock.unlock();
+			SwitchToFrameTasksCV.notify_all();
+
+			switchToFrame(FrameIndex);
+		}
+	});
 }
 
 DepthBoxVDB::VolData::VDB::~VDB()
 {
-	for (uint32_t i = 0; i < static_cast<uint32_t>(EStream::Max); ++i)
+	{
+		std::lock_guard<std::mutex> Lock(SwitchToFrameTasksMtx);
+		bCanSwitchToFrameWorkerRun = false;
+		SwitchToFrameTasksCV.notify_one();
+	}
+	SwitchToFrameWorker->join();
+
+	waitForAllTasks();
+
+	for (uint32_t i = 0; i < static_cast<uint32_t>(EStream::Num); ++i)
 	{
 		CUDA_CHECK(cudaStreamDestroy(Streams[i]));
 	}
@@ -55,6 +83,11 @@ DepthBoxVDB::VolData::VDB::~VDB()
 template <typename T> void DebugInCPU(const thrust::device_vector<T>& dVector, const char* Name)
 {
 	using namespace DepthBoxVDB::VolData;
+
+	if (dVector.empty())
+	{
+		throw std::exception("Algorithm Error!");
+	}
 
 	thrust::host_vector<T> hVetcor = dVector;
 	std ::string		   DebugMsg = std::format("CUDA Debug {}:\n\t", Name);
@@ -142,16 +175,62 @@ void DepthBoxVDB::VolData::VDB::EndAppendFrame()
 	SwitchToFrame(0);
 }
 
-void DepthBoxVDB::VolData::VDB::Popup(void* Params)
+void DepthBoxVDB::VolData::VDB::RecacheResidentFrames(const RecacheResidentFramesParameters& Params)
 {
-	auto PopupParams = *(DepthBoxVDB::VolData::VDB::PopupFrameParameters*)Params;
-	PopupParams.OutVDB->dVDBDataCurrentFrame = PopupParams.InRsdDataPF->dVDBData;
+	uint32_t FrameIndex =
+		ResidentIndices.empty() ? 0 : ResidentDataPerFrames[ResidentIndices.front()].FrameIndex;
+
+	invalidateResidentFrames();
+
+	MaxAllowedGPUMemoryInByte = static_cast<size_t>(Params.MaxAllowedGPUMemoryInGB) * (1 << 30);
+	MaxAllowedResidentFrameNum = Params.MaxAllowedResidentFrameNum;
+
+	if (!allocateResource())
+		return;
+
+	SwitchToFrame(FrameIndex);
+}
+
+uint32_t DepthBoxVDB::VolData::VDB::GetFrameIndex() const
+{
+	std::lock_guard<std::mutex> Lock(SwitchToFrameTasksMtx);
+
+	uint32_t FrameIndex = [&]() {
+		if (ResidentIndices.empty())
+			return std::numeric_limits<uint32_t>::max();
+		return ResidentDataPerFrames[ResidentIndices.front()].FrameIndex;
+	}();
+
+	SwitchToFrameTasksCV.notify_one();
+
+	return FrameIndex;
 }
 
 void DepthBoxVDB::VolData::VDB::SwitchToFrame(uint32_t FrameIndex)
 {
-	waitForAllStream();
-	switchToFrame(FrameIndex);
+	std::lock_guard<std::mutex> Lock(SwitchToFrameTasksMtx);
+
+	FrameIndexToPlay = FrameIndex;
+	SwitchToFrameTasks.emplace_back(FrameIndex);
+
+	SwitchToFrameTasksCV.notify_one();
+}
+
+bool DepthBoxVDB::VolData::VDB::IsSwitched() const
+{
+	std::lock_guard<std::mutex> Lock(SwitchToFrameTasksMtx);
+
+	bool bIsSwitched = [&]() {
+		if (ResidentIndices.empty())
+			return false;
+
+		return PlayingResidentFrameIndexItr == ResidentIndices.begin()
+			&& ResidentDataPerFrames[*PlayingResidentFrameIndexItr].FrameIndex == FrameIndexToPlay;
+	}();
+
+	SwitchToFrameTasksCV.notify_one();
+
+	return bIsSwitched;
 }
 
 void DepthBoxVDB::VolData::VDB::UpdateDepthBox(const UpdateDepthBoxParameters& Params)
@@ -167,8 +246,10 @@ void DepthBoxVDB::VolData::VDB::UpdateDepthBox(const UpdateDepthBoxParameters& P
 
 	for (uint32_t FrameIndex = 0; FrameIndex < GetFrameNum(); ++FrameIndex)
 	{
-		DataPerFrames[FrameIndex].bUpdatedFromEmptyScalarRanges = false;
+		DataPerFrames[FrameIndex].bDepthBoxUpdated = false;
 	}
+
+	SwitchToFrame(GetFrameIndex());
 }
 
 void DepthBoxVDB::VolData::VDB::generateDataPerFrame(
@@ -185,29 +266,24 @@ void DepthBoxVDB::VolData::VDB::generateDataPerFrame(
 	uint32_t VoxelNumPerBrick = static_cast<uint32_t>(VDBParams.ChildPerLevels[0]);
 	VoxelNumPerBrick = VoxelNumPerBrick * VoxelNumPerBrick * VoxelNumPerBrick;
 
-	std::vector<std::future<void>> Futures(BrickNum);
-
 	if (DataPerFrames.size() <= FrameIndex)
 	{
 		DataPerFrames.resize(FrameIndex + 1);
 	}
 	auto& BrickedData = DataPerFrames[FrameIndex].BrickedData;
-	BrickedData.resize(SizeOfVoxelType(VDBParams.VoxelType) * BrickNum * VoxelNumPerAtlasBrick);
 	auto& BrickSortKeys = DataPerFrames[FrameIndex].BrickSortKeys;
-	BrickSortKeys.clear();
-	auto& dBrickSortKeys = DataPerFrames[FrameIndex].dBrickSortKeys;
 
+	BrickedData.resize(SizeOfVoxelType(VDBParams.VoxelType) * BrickNum * VoxelNumPerAtlasBrick);
+	BrickedData.shrink_to_fit();
 	std::vector<uint8_t> BrickValids(BrickNum, 0);
-	auto Assign = [&]<typename T>(T* Dst, const T* Src, const CoordType& BrickCoord) {
+	auto				 Assign = [&]<typename T>(
+					  T* Dst, const T* Src, uint32_t BrickIndex, const CoordType& BrickCoord) {
 		auto Sample = [&](CoordType Coord) -> T {
 			Coord = glm::clamp(Coord, CoordType(0), VDBParams.VoxelPerVolume - 1);
 			return Src[Coord.z * VoxelYxX + Coord.y * VDBParams.VoxelPerVolume.x + Coord.x];
 		};
 
 		CoordType MinCoord = BrickCoord * VDBParams.ChildPerLevels[0];
-		uint32_t  BrickIndex =
-			BrickCoord.z * BrickYxX + BrickCoord.y * VDBParams.BrickPerVolume.x + BrickCoord.x;
-
 		uint32_t  EmptyVoxelNum = 0;
 		T*		  DstPitchPtr = nullptr;
 		CoordType dCoord;
@@ -224,7 +300,7 @@ void DepthBoxVDB::VolData::VDB::generateDataPerFrame(
 				for (dCoord.x = VoxelApronOffset;
 					 dCoord.x < VDBParams.VoxelPerAtlasBrick - VoxelApronOffset; ++dCoord.x)
 				{
-					T Scalar = Sample(MinCoord + dCoord - VDBParams.ApronAndDepthWidth);
+					T Scalar = Sample(MinCoord - VDBParams.ApronAndDepthWidth + dCoord);
 					DstPitchPtr[dCoord.x] = Scalar;
 
 					bool bInBrick = true;
@@ -262,45 +338,42 @@ void DepthBoxVDB::VolData::VDB::generateDataPerFrame(
 	};
 
 	{
-		uint32_t  BrickIndex = 0;
-		CoordType BrickCoord;
-		for (BrickCoord.z = 0; BrickCoord.z < VDBParams.BrickPerVolume.z; ++BrickCoord.z)
-			for (BrickCoord.y = 0; BrickCoord.y < VDBParams.BrickPerVolume.y; ++BrickCoord.y)
-				for (BrickCoord.x = 0; BrickCoord.x < VDBParams.BrickPerVolume.x; ++BrickCoord.x)
-				{
-					switch (VDBParams.VoxelType)
-					{
-						case EVoxelType::UInt8:
-							Futures[BrickIndex] =
-								std::async(Assign, reinterpret_cast<uint8_t*>(BrickedData.data()),
-									reinterpret_cast<const uint8_t*>(RAWVolumeData), BrickCoord);
-							break;
-						case EVoxelType::UInt16:
-							Futures[BrickIndex] =
-								std::async(Assign, reinterpret_cast<uint16_t*>(BrickedData.data()),
-									reinterpret_cast<const uint16_t*>(RAWVolumeData), BrickCoord);
-							break;
-						case EVoxelType::Float32:
-							Futures[BrickIndex] =
-								std::async(Assign, reinterpret_cast<float*>(BrickedData.data()),
-									reinterpret_cast<const float*>(RAWVolumeData), BrickCoord);
-							break;
-						default:
-							assert(false);
-					}
+		constexpr auto ExecutionPolicy = std::execution::par_unseq;
 
-					++BrickIndex;
+		std::vector<uint32_t> BrickIndices(BrickNum);
+		std::ranges::generate(
+			BrickIndices, [BrickIndex = uint32_t(0)]() mutable { return BrickIndex++; });
+		std::for_each(
+			ExecutionPolicy, BrickIndices.begin(), BrickIndices.end(), [&](uint32_t BrickIndex) {
+				CoordType BrickCoord = IndexToCoord(BrickIndex, VDBParams.BrickPerVolume);
+
+				switch (VDBParams.VoxelType)
+				{
+					case EVoxelType::UInt8:
+						Assign(reinterpret_cast<uint8_t*>(BrickedData.data()),
+							reinterpret_cast<const uint8_t*>(RAWVolumeData), BrickIndex,
+							BrickCoord);
+						break;
+					case EVoxelType::UInt16:
+						Assign(reinterpret_cast<uint16_t*>(BrickedData.data()),
+							reinterpret_cast<const uint16_t*>(RAWVolumeData), BrickIndex,
+							BrickCoord);
+						break;
+					case EVoxelType::Float32:
+						Assign(reinterpret_cast<float*>(BrickedData.data()),
+							reinterpret_cast<const float*>(RAWVolumeData), BrickIndex, BrickCoord);
+						break;
+					default:
+						throw std::exception("Algorithm Error!");
 				}
-		for (auto& Future : Futures)
-		{
-			Future.wait();
-		}
+			});
 	}
 
 	{
 		uint32_t ValidBrickNum = std::count_if(
 			BrickValids.begin(), BrickValids.end(), [](uint8_t Valid) { return Valid == 1; });
 
+		BrickSortKeys.clear();
 		BrickSortKeys.reserve(ValidBrickNum);
 		BrickSortKey BSKey;
 		BSKey.LevelPosition.Level = 0;
@@ -317,11 +390,6 @@ void DepthBoxVDB::VolData::VDB::generateDataPerFrame(
 			BSKey.LevelPosition.Z = BrickCoordWithFrame.z;
 			BrickSortKeys.emplace_back(BSKey);
 		}
-
-		dBrickSortKeys.resize(ValidBrickNum);
-		CUDA_CHECK(cudaMemcpyAsync(thrust::raw_pointer_cast(dBrickSortKeys.data()),
-			BrickSortKeys.data(), sizeof(BrickSortKey) * ValidBrickNum, cudaMemcpyHostToDevice,
-			getStream(EStream::Copy)));
 	}
 }
 
@@ -362,9 +430,21 @@ bool DepthBoxVDB::VolData::VDB::allocateResource()
 		}
 		--MaxResidentFrameNum;
 
+		if (NeededValidBrickNumInPlayLoop == 0)
+		{
+			std::cerr << "No valid bricks found.\n";
+			return false;
+		}
+
 		if (MaxResidentFrameNum == 0)
 		{
-			std::cerr << "MaxAllowedGPUMemory is too small.\n";
+			std::cerr << "MaxAllowedGPUMemory is too small for Atlas.\n";
+			return false;
+		}
+		if (MaxResidentFrameNum < 2 && FrameNum > 1)
+		{
+			std::cerr << std::format(
+				"MaxResidentFrameNum:{} < 2 when FrameNum:{} > 1.", MaxResidentFrameNum, FrameNum);
 			return false;
 		}
 
@@ -383,10 +463,11 @@ bool DepthBoxVDB::VolData::VDB::allocateResource()
 		NeededVoxelPerAtlas *= VDBParams.VoxelPerAtlasBrick;
 
 		size_t AtlasGPUMemInByte = SizeOfVoxelType(VDBParams.VoxelType) * NeededVoxelPerAtlas.z
-			* NeededVoxelPerAtlas.y * NeededVoxelPerAtlas.z;
-		if (AtlasGPUMemInByte > MaxAllowedGPUMemoryInByte)
+			* NeededVoxelPerAtlas.y * NeededVoxelPerAtlas.x;
+		Status.AtlasGPUMemInByte = AtlasGPUMemInByte;
+		if (Status.AtlasGPUMemInByte > MaxAllowedGPUMemoryInByte)
 		{
-			std::cerr << "MaxAllowedGPUMemory is too small.\n";
+			std::cerr << "MaxAllowedGPUMemory is too small for Atlas.\n";
 			return false;
 		}
 	}
@@ -406,7 +487,7 @@ bool DepthBoxVDB::VolData::VDB::allocateResource()
 				ChannelDesc = cudaCreateChannelDesc<float>();
 				break;
 			default:
-				assert(false);
+				throw std::exception("Algorithm Error!");
 		}
 		AtlasArray = std::make_shared<CUDA::Array>(ChannelDesc, NeededVoxelPerAtlas);
 	}
@@ -417,7 +498,7 @@ bool DepthBoxVDB::VolData::VDB::allocateResource()
 
 	// Init Mapping Tables
 	BrickWithFrameToAtlasBrick.assign(FrameNum * VDBParams.BrickPerVolume.z
-			* VDBParams.BrickPerVolume.y * VDBParams.BrickPerVolume.z,
+			* VDBParams.BrickPerVolume.y * VDBParams.BrickPerVolume.x,
 		kInvalidIndex);
 	dBrickWithFrameToAtlasBrick.resize(BrickWithFrameToAtlasBrick.size());
 
@@ -427,14 +508,97 @@ bool DepthBoxVDB::VolData::VDB::allocateResource()
 	dAtlasBrickToBrickWithFrame.resize(AtlasBrickNum);
 
 	AvailableAtlasBrick.reserve(AtlasBrickNum);
-	for (uint32_t BrickIndex = 0; BrickIndex < AtlasBrickNum; ++BrickIndex)
+	auto InitAvailableAtlasBrick = [&]() {
+		for (uint32_t BrickIndex = 0; BrickIndex < AtlasBrickNum; ++BrickIndex)
+		{
+			AvailableAtlasBrick.emplace_back(BrickIndex);
+		}
+	};
+
+	// Try to cache each frame to compute GPU Mem used by Pools
 	{
-		AvailableAtlasBrick.emplace_back(BrickIndex);
+		ResidentDataPerFrames.clear();
+		ResidentDataPerFrames.resize(1);
+		auto& RsdDataPF = ResidentDataPerFrames.front();
+		for (uint32_t FrameIndex = 0; FrameIndex < DataPerFrames.size(); ++FrameIndex)
+		{
+			auto& DataPF = DataPerFrames[FrameIndex];
+			DataPF.PoolGPUMemInByte = 0;
+
+			// Allocate
+			InitAvailableAtlasBrick();
+
+			RsdDataPF.Invalidate(ResidentIndices.end());
+			RsdDataPF.FrameIndex = FrameIndex;
+			for (uint32_t BSKIndex = 0; BSKIndex < DataPF.BrickSortKeys.size(); ++BSKIndex)
+			{
+#ifdef DEPTHBOX_DEBUG
+				if (AvailableAtlasBrick.empty())
+				{
+					throw std::exception("Algorithm Error!");
+				}
+#endif
+				uint32_t BrickIndexWithFrame = [&]() {
+					BrickSortKey	   BSKey = DataPF.BrickSortKeys[BSKIndex];
+					CoordWithFrameType BrickCoordWithFrame;
+					BrickCoordWithFrame.x = BSKey.LevelPosition.X;
+					BrickCoordWithFrame.y = BSKey.LevelPosition.Y;
+					BrickCoordWithFrame.z = BSKey.LevelPosition.Z;
+					BrickCoordWithFrame.w = RsdDataPF.FrameIndex;
+
+					return BrickCoordToIndex(BrickCoordWithFrame);
+				}();
+
+				uint32_t AtlasBrickIndex = AvailableAtlasBrick.back();
+				AvailableAtlasBrick.pop_back();
+
+				RsdDataPF.BrickWithFrameToAtlasBrick.emplace(BrickIndexWithFrame, AtlasBrickIndex);
+				BrickWithFrameToAtlasBrick[BrickIndexWithFrame] = AtlasBrickIndex;
+				AtlasBrickToBrickWithFrame[AtlasBrickIndex] = BrickIndexWithFrame;
+			}
+
+			transferBrickDataToAtlas(0);
+			updateDepthBox(0);
+			buildVDB(0);
+
+			RsdDataPF.Wait(ResidentDataPerFrame::EEvent::BuildVDB);
+
+			for (auto& dNodes : RsdDataPF.dNodePerLevels)
+				DataPF.PoolGPUMemInByte += sizeof(VDBNode) * dNodes.size();
+			for (auto& dChilds : RsdDataPF.dChildPerLevels)
+				DataPF.PoolGPUMemInByte += sizeof(uint32_t) * dChilds.size();
+
+			// Recycle
+			for (auto [BrickIndexWithFrame, AtlasBrickIndex] : RsdDataPF.BrickWithFrameToAtlasBrick)
+			{
+				BrickWithFrameToAtlasBrick[BrickIndexWithFrame] = kInvalidIndex;
+				AtlasBrickToBrickWithFrame[AtlasBrickIndex] = kInvalidIndex;
+				AvailableAtlasBrick.emplace_back(AtlasBrickIndex);
+			}
+		}
+
+		Status.PoolGPUMemInByteForAllFrames = 0;
+		for (auto& DataPF : DataPerFrames)
+			Status.PoolGPUMemInByteForAllFrames += DataPF.PoolGPUMemInByte;
+
+		if (Status.AtlasGPUMemInByte + Status.PoolGPUMemInByteForAllFrames
+			> MaxAllowedGPUMemoryInByte)
+		{
+			std::cerr << "MaxAllowedGPUMemory is too small for Atlas and Pools.\n";
+			return false;
+		}
+
+		InitAvailableAtlasBrick();
 	}
 
 	// Resize Resident Frames
 	ResidentDataPerFrames.clear();
 	ResidentDataPerFrames.resize(MaxResidentFrameNum);
+	for (uint32_t ResidentIndex = 0; ResidentIndex < MaxResidentFrameNum; ++ResidentIndex)
+	{
+		AvailableResidentIndices.emplace_back(ResidentIndex);
+		ResidentDataPerFrames[ResidentIndex].Invalidate(ResidentIndices.end());
+	}
 
 	return true;
 }
@@ -490,7 +654,7 @@ void DepthBoxVDB::VolData::VDB::transferBrickDataToAtlas(uint32_t ResidentIndex)
 					reinterpret_cast<float*>(BrickedData.data()), BrickIndex, AtlasBrickIndex);
 				break;
 			default:
-				assert(false);
+				throw std::exception("Algorithm Error!");
 		}
 	}
 	// Transfer Mapping
@@ -517,7 +681,7 @@ void DepthBoxVDB::VolData::VDB::updateDepthBox(uint32_t ResidentIndex)
 	auto&	 RsdDataPF = ResidentDataPerFrames[ResidentIndex];
 	uint32_t FrameIndex = RsdDataPF.FrameIndex;
 	auto&	 DataPF = DataPerFrames[FrameIndex];
-	if (DataPF.bUpdatedFromEmptyScalarRanges)
+	if (DataPF.bDepthBoxUpdated)
 		return;
 
 	RsdDataPF.Wait(
@@ -534,12 +698,13 @@ void DepthBoxVDB::VolData::VDB::updateDepthBox(uint32_t ResidentIndex)
 			updateDepthBox<float>(FrameIndex);
 			break;
 		default:
-			assert(false);
+			throw std::exception("Algorithm Error!");
 	}
 	RsdDataPF.Record(ResidentDataPerFrame::EEvent::UpdateDepthBox, getStream(EStream::Atlas));
 
-	DataPF.bUpdatedFromEmptyScalarRanges = true;
-	DataPF.bTransferredToCPU = false;
+	DataPF.bDepthBoxUpdated = true;
+
+	transferBrickDataToCPU(ResidentIndex);
 }
 
 template <typename VoxelType> void DepthBoxVDB::VolData::VDB::updateDepthBox(uint32_t FrameIndex)
@@ -585,22 +750,22 @@ template <typename VoxelType> void DepthBoxVDB::VolData::VDB::updateDepthBox(uin
 		switch (FaceIndex)
 		{
 			case 0:
-				Coord.z = 0;
+				Coord.z = -1;
 				break;
 			case 1:
-				Coord.z = VDBParams.ChildPerLevels[0] - 1;
+				Coord.z = VDBParams.ChildPerLevels[0];
 				break;
 			case 2:
-				Coord.x = 0;
+				Coord.x = -1;
 				break;
 			case 3:
-				Coord.x = VDBParams.ChildPerLevels[0] - 1;
+				Coord.x = VDBParams.ChildPerLevels[0];
 				break;
 			case 4:
-				Coord.y = 0;
+				Coord.y = -1;
 				break;
 			case 5:
-				Coord.y = VDBParams.ChildPerLevels[0] - 1;
+				Coord.y = VDBParams.ChildPerLevels[0];
 				break;
 		}
 
@@ -669,24 +834,7 @@ template <typename VoxelType> void DepthBoxVDB::VolData::VDB::updateDepthBox(uin
 			}
 			return false;
 		};
-		VoxelType Depth = 0;
-		while (true)
-		{
-			bool bEmpty = true;
-#ifdef __CUDA_ARCH__
-	#pragma unroll
-#endif
-			for (CoordValueType RhtVal = -1; RhtVal <= 1; ++RhtVal)
-#ifdef __CUDA_ARCH__
-	#pragma unroll
-#endif
-				for (CoordValueType UpVal = -1; UpVal <= 1; ++UpVal)
-				{
-					bEmpty &= IsEmpty(Coord + RhtVal * Rht + UpVal * Up);
-				}
-			if (!bEmpty || Depth >= VDBParams.ChildPerLevels[0] - 1)
-				break;
-
+		auto March = [&]() {
 			switch (FaceIndex)
 			{
 				case 0:
@@ -708,6 +856,41 @@ template <typename VoxelType> void DepthBoxVDB::VolData::VDB::updateDepthBox(uin
 					Coord.y -= 1;
 					break;
 			}
+		};
+		VoxelType Depth = 0;
+		bool	  bEmpty = true;
+
+		// Test apron first
+#ifdef __CUDA_ARCH__
+	#pragma unroll
+#endif
+		for (CoordValueType RhtVal = -1; RhtVal <= 1; ++RhtVal)
+#ifdef __CUDA_ARCH__
+	#pragma unroll
+#endif
+			for (CoordValueType UpVal = -1; UpVal <= 1; ++UpVal)
+			{
+				bEmpty &= IsEmpty(Coord + RhtVal * Rht + UpVal * Up);
+			}
+		March();
+
+		while (bEmpty)
+		{
+#ifdef __CUDA_ARCH__
+	#pragma unroll
+#endif
+			for (CoordValueType RhtVal = -1; RhtVal <= 1; ++RhtVal)
+#ifdef __CUDA_ARCH__
+	#pragma unroll
+#endif
+				for (CoordValueType UpVal = -1; UpVal <= 1; ++UpVal)
+				{
+					bEmpty &= IsEmpty(Coord + RhtVal * Rht + UpVal * Up);
+				}
+			if (!bEmpty || Depth >= VDBParams.ChildPerLevels[0] - 1)
+				break;
+
+			March();
 			++Depth;
 		}
 		Depth = Depth == 1 ? 0 : Depth;
@@ -731,8 +914,6 @@ void DepthBoxVDB::VolData::VDB::transferBrickDataToCPU(uint32_t ResidentIndex)
 	auto&	 RsdDataPF = ResidentDataPerFrames[ResidentIndex];
 	uint32_t FrameIndex = RsdDataPF.FrameIndex;
 	auto&	 DataPF = DataPerFrames[FrameIndex];
-	if (!DataPF.bTransferredToCPU)
-		return;
 
 	uint32_t BrickNum = static_cast<uint32_t>(VDBParams.BrickPerVolume.z)
 		* VDBParams.BrickPerVolume.y * VDBParams.BrickPerVolume.x;
@@ -777,13 +958,11 @@ void DepthBoxVDB::VolData::VDB::transferBrickDataToCPU(uint32_t ResidentIndex)
 				Transfer(reinterpret_cast<float*>(BrickedData.data()), BrickIndex, AtlasBrickIndex);
 				break;
 			default:
-				assert(false);
+				throw std::exception("Algorithm Error!");
 		}
 	}
 	RsdDataPF.Record(
 		ResidentDataPerFrame::EEvent::TransferBrickDataToCPU, getStream(EStream::Copy));
-
-	DataPF.bTransferredToCPU = false;
 }
 
 void DepthBoxVDB::VolData::VDB::buildVDB(uint32_t ResidentIndex)
@@ -797,21 +976,20 @@ void DepthBoxVDB::VolData::VDB::buildVDB(uint32_t ResidentIndex)
 	auto& dVDBData = RsdDataPF.dVDBData;
 
 	uint32_t FrameIndex = RsdDataPF.FrameIndex;
-	uint32_t ValidBrickNum = DataPerFrames[FrameIndex].BrickSortKeys.size();
 	uint32_t BrickYxX = VDBParams.BrickPerVolume.x * VDBParams.BrickPerVolume.y;
 	uint32_t BrickNum = VDBParams.BrickPerVolume.z * BrickYxX;
 
-	auto& DataPF = DataPerFrames[FrameIndex];
+	auto&	 DataPF = DataPerFrames[FrameIndex];
+	uint32_t ValidBrickNum = DataPF.BrickSortKeys.size();
 
 	RsdDataPF.Wait(getStream(EStream::VDB), ResidentDataPerFrame::EEvent::TransferBrickDataToAtlas);
 	RsdDataPF.Wait(getStream(EStream::VDB), ResidentDataPerFrame::EEvent::UpdateDepthBox);
 
-	// Assign Brick Sort Keys to non-emptY Brick at level 0
-	thrust::device_vector<BrickSortKey> dBrickSortKeys(
-		(VDBParams.RootLevel + 1) * ValidBrickNum, BrickSortKey::Invalid());
+	dBrickSortKeys.assign(VDBParams.RootLevel * ValidBrickNum, BrickSortKey::Invalid());
+	// Assign Brick Sort Keys to non-empty Brick at level 0
 	CUDA_CHECK(cudaMemcpyAsync(thrust::raw_pointer_cast(dBrickSortKeys.data()),
-		thrust::raw_pointer_cast(DataPF.dBrickSortKeys.data()),
-		sizeof(BrickSortKey) * ValidBrickNum, cudaMemcpyDeviceToDevice, getStream(EStream::VDB)));
+		DataPF.BrickSortKeys.data(), sizeof(BrickSortKey) * ValidBrickNum, cudaMemcpyHostToDevice,
+		getStream(EStream::VDB)));
 
 	// 1. Assign Brick Sort Keys to non-empty Brick at level 1,2,...
 	// 2. Sort Brick Sort Keys
@@ -822,14 +1000,15 @@ void DepthBoxVDB::VolData::VDB::buildVDB(uint32_t ResidentIndex)
 										 VDBParams = VDBParams] __device__(uint32_t ValidIndex) {
 			BrickSortKey BSKey = BrickSortKeys[ValidIndex];
 			uint64_t	 BSKIndex = ValidIndex;
-			for (int32_t Lev = 1; Lev <= VDBParams.RootLevel; ++Lev)
+
+			for (int32_t Lev = 1; Lev < VDBParams.RootLevel; ++Lev)
 			{
 				BSKey.LevelPosition.Level = Lev;
 				BSKey.LevelPosition.X /= VDBParams.ChildPerLevels[Lev];
 				BSKey.LevelPosition.Y /= VDBParams.ChildPerLevels[Lev];
 				BSKey.LevelPosition.Z /= VDBParams.ChildPerLevels[Lev];
 
-				BSKIndex = Lev * ValidBrickNum + ValidIndex;
+				BSKIndex += ValidBrickNum;
 				BrickSortKeys[BSKIndex] = BSKey;
 			}
 		};
@@ -849,8 +1028,7 @@ void DepthBoxVDB::VolData::VDB::buildVDB(uint32_t ResidentIndex)
 			CUDA::Compact(dBrickSortKeys, dDiffs, uint32_t(0), getStream(EStream::VDB));
 
 #ifdef DEPTHBOX_DEBUG
-		CUDA_CHECK(cudaStreamSynchronize(getStream(EStream::VDB)));
-		CUDA_DEBUG_IN_CPU(dBrickSortKeys);
+		// CUDA_DEBUG_IN_CPU(dBrickSortKeys);
 #endif
 	}
 
@@ -870,14 +1048,14 @@ void DepthBoxVDB::VolData::VDB::buildVDB(uint32_t ResidentIndex)
 
 					  auto ItrCurrLev = dBrickSortKeys.begin() + StartCurrLev;
 					  auto ItrNextLev =
-						  thrust::lower_bound(thrust::cuda::par.on(getStream(EStream::VDB)),
-							  ItrCurrLev, dBrickSortKeys.end(), KeyNextLev);
+						  thrust::lower_bound(ItrCurrLev, dBrickSortKeys.end(), KeyNextLev);
 
 					  return thrust::distance(ItrCurrLev, ItrNextLev);
 				  }();
 			StartCurrLev += NumCurrLev;
 
 			dNodePerLevels[Lev].assign(NumCurrLev, VDBNode::CreateInvalid());
+			dNodePerLevels[Lev].shrink_to_fit();
 
 			if (Lev > 0)
 			{
@@ -885,6 +1063,7 @@ void DepthBoxVDB::VolData::VDB::buildVDB(uint32_t ResidentIndex)
 				dChildPerLevels[Lev - 1].assign(
 					dNodePerLevels[Lev].size() * ChildCurrLev * ChildCurrLev * ChildCurrLev,
 					VDBData::kInvalidChild);
+				dChildPerLevels[Lev - 1].shrink_to_fit();
 			}
 		}
 	}
@@ -903,8 +1082,7 @@ void DepthBoxVDB::VolData::VDB::buildVDB(uint32_t ResidentIndex)
 				thrust::raw_pointer_cast(dChildPerLevels[Lev - 1].data());
 		}
 	}
-	CUDA_CHECK(cudaMemcpyAsync(
-		dVDBData, &VDBData, sizeof(VDBData), cudaMemcpyHostToDevice, getStream(EStream::VDB)));
+	CUDA_CHECK(cudaMemcpy(dVDBData, &VDBData, sizeof(VDBData), cudaMemcpyHostToDevice));
 
 	// Assign Node and Child Pools
 	{
@@ -989,21 +1167,38 @@ void DepthBoxVDB::VolData::VDB::buildVDB(uint32_t ResidentIndex)
 		}
 
 #ifdef DEPTHBOX_DEBUG
-		CUDA_CHECK(cudaStreamSynchronize(getStream(EStream::VDB)));
-
-		for (int32_t Lev = VDBParams.RootLevel; Lev >= 0; --Lev)
+		/*for (int32_t Lev = VDBParams.RootLevel; Lev >= 0; --Lev)
 		{
-			std::cout << std::format("Lev: {}\n", Lev);
+			std::cout << std::format("Lev: {}\n", Lev);bb
 			CUDA_DEBUG_IN_CPU(dNodePerLevels[Lev]);
 			if (Lev > 0)
 			{
 				CUDA_DEBUG_IN_CPU(dChildPerLevels[Lev - 1]);
 			}
-		}
+		}*/
 #endif
 	}
 
 	RsdDataPF.Record(ResidentDataPerFrame::EEvent::BuildVDB, getStream(EStream::VDB));
+}
+
+void DepthBoxVDB::VolData::VDB::switchFrame(ResidentDataPerFrame& RsdDataPF)
+{
+	RsdDataPF.Wait(getStream(EStream::Render), ResidentDataPerFrame::EEvent::BuildVDB);
+	CUDA_CHECK(cudaLaunchHostFunc(getStream(EStream::Render), switchFrameCUDAHostFunc, this));
+	RsdDataPF.Record(ResidentDataPerFrame::EEvent::SwitchFrame, getStream(EStream::Render));
+}
+
+void DepthBoxVDB::VolData::VDB::switchFrameCUDAHostFunc(void* VDBPtr)
+{
+	VDB* Self = reinterpret_cast<VDB*>(VDBPtr);
+
+	// Switch playing frame to to-play frame
+	uint32_t ResidentIndex = Self->ResidentIndices.front();
+	auto&	 RsdDataPF = Self->ResidentDataPerFrames[ResidentIndex];
+
+	Self->dVDBDataCurrentFrame = RsdDataPF.dVDBData;
+	Self->PlayingResidentFrameIndexItr = Self->ResidentIndices.begin();
 }
 
 void DepthBoxVDB::VolData::VDB::switchToFrame(uint32_t FrameIndex)
@@ -1012,140 +1207,237 @@ void DepthBoxVDB::VolData::VDB::switchToFrame(uint32_t FrameIndex)
 	if (FrameIndex >= FrameNum)
 	{
 		std::cerr << std::format("FrameIndex:{} >= FrameNum:{}.", FrameIndex, FrameNum);
-		dVDBDataCurrentFrame = nullptr;
 		return;
 	}
 
 	uint32_t BrickNum = static_cast<uint32_t>(VDBParams.BrickPerVolume.z)
 		* VDBParams.BrickPerVolume.y * VDBParams.BrickPerVolume.x;
+	uint32_t RealMaxResidentFrameNum = MaxResidentFrameNum;
+	if (PlayingResidentFrameIndexItr != ResidentIndices.end())
+	{
+		--RealMaxResidentFrameNum;
+	}
 
 	// Recycle and back to Atlas
-	uint32_t ResidentFrameNum = ResidentIndices.size();
+	ResidentDataPerFrame* CachedRsdDataPFPtr = nullptr;
+	bool				  bIsFrameBeforeCachedResidents = true;
 	{
-		uint32_t ResidentFrameNumPriorToCurr = ResidentFrameNum;
-		while (ResidentFrameNumPriorToCurr != 0 && [&]() {
-			return ResidentDataPerFrames[ResidentIndices.front()].FrameIndex != FrameIndex;
-		}())
+		uint32_t ResidentFrameNum = ResidentIndices.size();
+		for (uint32_t i = 0; i < ResidentFrameNum; ++i)
 		{
 			uint32_t ResidentIndex = ResidentIndices.front();
-			ResidentIndices.pop_front();
-			auto& RsdDataPF = ResidentDataPerFrames[ResidentIndex];
+			auto&	 RsdDataPF = ResidentDataPerFrames[ResidentIndex];
 
-			if (RsdDataPF.FrameIndex + FrameNum <= FrameIndex + MaxResidentFrameNum - 1)
+			// Wait to ensure switching order is the same as calling order
+			RsdDataPF.Wait(ResidentDataPerFrame::EEvent::SwitchFrame);
+
+			// If it is the to-be-played frame, pop it to the front
+			if (RsdDataPF.FrameIndex == FrameIndex)
 			{
-				// Should still be resident, move it to the tail of ResidentIndices
+				CachedRsdDataPFPtr = &RsdDataPF;
+				bIsFrameBeforeCachedResidents = false;
+			}
+
+			bool bIsSuccessor = [&]() {
+				if (RsdDataPF.FrameIndex == FrameIndex)
+					return true;
+				else if (RsdDataPF.FrameIndex < FrameIndex)
+					return RsdDataPF.FrameIndex + FrameNum
+						<= FrameIndex + RealMaxResidentFrameNum - 1;
+				else
+					return RsdDataPF.FrameIndex <= FrameIndex + RealMaxResidentFrameNum - 1;
+			}();
+			bool bIsPlaying = ResidentIndices.begin() == PlayingResidentFrameIndexItr;
+			if (
+				// Successors should still be resident
+				bIsSuccessor ||
+				// If it is the playing frame but not a successor, should still be resident
+				bIsPlaying)
+			{
+				// Move it to the tail of ResidentIndices
+				ResidentIndices.pop_front();
 				ResidentIndices.emplace_back(ResidentIndex);
 				RsdDataPF.ResidentIndicesItr = std::prev(ResidentIndices.end());
-				--ResidentFrameNumPriorToCurr;
+				if (bIsPlaying)
+				{
+					PlayingResidentFrameIndexItr = RsdDataPF.ResidentIndicesItr;
+				}
+
 				continue;
 			}
 
-			// Mark it as NOT resident by swapping with the tail of ResidentDataPerFrames
+			// Mark it as NOT resident
 			for (auto [BrickIndexWithFrame, AtlasBrickIndex] : RsdDataPF.BrickWithFrameToAtlasBrick)
 			{
 				BrickWithFrameToAtlasBrick[BrickIndexWithFrame] = kInvalidIndex;
 				AtlasBrickToBrickWithFrame[AtlasBrickIndex] = kInvalidIndex;
 				AvailableAtlasBrick.emplace_back(AtlasBrickIndex);
 			}
-			RsdDataPF.Invalidate();
-			--ResidentFrameNum;
-			std::swap(
-				ResidentDataPerFrames[ResidentFrameNum], ResidentDataPerFrames[ResidentIndex]);
-			*ResidentDataPerFrames[ResidentFrameNum].ResidentIndicesItr = ResidentIndex;
 
-			--ResidentFrameNumPriorToCurr;
+			ResidentIndices.pop_front();
+			RsdDataPF.Invalidate(ResidentIndices.end());
+			AvailableResidentIndices.emplace_back(ResidentIndex);
 		}
 	}
-
-	// Allocate from Atlas and perform Transfer and Compuatation
+	if (ResidentIndices.empty())
 	{
-		uint32_t NewNeededFrameIndex = ResidentFrameNum == 0
-			? FrameIndex
-			: (ResidentDataPerFrames[ResidentIndices.back()].FrameIndex + 1) % FrameNum;
-		uint32_t NewNeededNum = MaxResidentFrameNum - ResidentFrameNum;
-		for (uint32_t NewNeededIndex = 0; NewNeededIndex < NewNeededNum; ++NewNeededIndex)
-		{
-			uint32_t ResidentIndex = ResidentFrameNum;
-			++ResidentFrameNum;
-			ResidentIndices.emplace_back(ResidentIndex);
+		bIsFrameBeforeCachedResidents = false;
+	}
 
-			auto& RsdDataPF = ResidentDataPerFrames[ResidentIndex];
-			RsdDataPF.FrameIndex = NewNeededFrameIndex;
-			RsdDataPF.ResidentIndicesItr = std::prev(ResidentIndices.end());
-			NewNeededFrameIndex = (NewNeededFrameIndex + 1) % FrameNum;
-
-			auto& DataPF = DataPerFrames[RsdDataPF.FrameIndex];
-			for (uint32_t BSKIndex = 0; BSKIndex < DataPF.BrickSortKeys.size(); ++BSKIndex)
-			{
 #ifdef DEPTHBOX_DEBUG
-				if (AvailableAtlasBrick.empty())
-				{
-					throw std::exception("Algorithm Error!");
-				}
+	{
+		std::string DebugMsg = "Remained Needed Frames: ";
+		for (uint32_t ResidentIndex : ResidentIndices)
+		{
+			DebugMsg += std::format("{}, ", ResidentDataPerFrames[ResidentIndex].FrameIndex);
+		}
+		DebugMsg.push_back('\n');
+		std::cout << DebugMsg;
+	}
 #endif
-				uint32_t BrickIndexWithFrame = [&]() {
-					BrickSortKey	   BSKey = DataPF.BrickSortKeys[BSKIndex];
-					CoordWithFrameType BrickCoordWithFrame;
-					BrickCoordWithFrame.x = BSKey.LevelPosition.X;
-					BrickCoordWithFrame.y = BSKey.LevelPosition.Y;
-					BrickCoordWithFrame.z = BSKey.LevelPosition.Z;
-					BrickCoordWithFrame.w = RsdDataPF.FrameIndex;
 
-					return BrickCoordToIndex(BrickCoordWithFrame);
-				}();
+	// Allocate from Atlas and perform Transfer and Computation
+	uint32_t			  NewNeededFrameNum = MaxResidentFrameNum - ResidentIndices.size();
+	std::vector<uint32_t> NewNeededResidentIndices;
+	NewNeededResidentIndices.reserve(NewNeededFrameNum);
+	auto	 PrevInsertItr = ResidentIndices.end();
+	uint32_t NewNeededFrameIndex = bIsFrameBeforeCachedResidents || ResidentIndices.empty()
+		? FrameIndex
+		: (ResidentDataPerFrames[ResidentIndices.back()].FrameIndex + 1) % FrameNum;
+	for (uint32_t i = 0; i < NewNeededFrameNum; ++i)
+	{
+#ifdef DEPTHBOX_DEBUG
+		if (AvailableResidentIndices.empty())
+		{
+			throw std::exception("Algorithm Error!");
+		}
+#endif
+		uint32_t ResidentIndex = AvailableResidentIndices.back();
+		AvailableResidentIndices.pop_back();
 
-				uint32_t AtlasBrickIndex = AvailableAtlasBrick.back();
-				AvailableAtlasBrick.pop_back();
-
-				RsdDataPF.BrickWithFrameToAtlasBrick.emplace(BrickIndexWithFrame, AtlasBrickIndex);
-				BrickWithFrameToAtlasBrick[BrickIndexWithFrame] = AtlasBrickIndex;
-				AtlasBrickToBrickWithFrame[AtlasBrickIndex] = BrickIndexWithFrame;
+		if (bIsFrameBeforeCachedResidents)
+			if (PrevInsertItr == ResidentIndices.end())
+			{
+				ResidentIndices.emplace_front(ResidentIndex);
+				PrevInsertItr = ResidentIndices.begin();
 			}
+			else
+			{
+				PrevInsertItr = ResidentIndices.emplace(std::next(PrevInsertItr), ResidentIndex);
+			}
+		else
+		{
+			ResidentIndices.emplace_back(ResidentIndex);
+			PrevInsertItr = std::prev(ResidentIndices.end());
+		}
+		NewNeededResidentIndices.emplace_back(ResidentIndex);
 
-			transferBrickDataToAtlas(ResidentIndex);
-			updateDepthBox(ResidentIndex);
-			transferBrickDataToCPU(ResidentIndex);
-			buildVDB(ResidentIndex);
+		auto& RsdDataPF = ResidentDataPerFrames[ResidentIndex];
+		RsdDataPF.FrameIndex = NewNeededFrameIndex;
+		NewNeededFrameIndex = (NewNeededFrameIndex + 1) % FrameNum;
+		RsdDataPF.ResidentIndicesItr = PrevInsertItr;
+
+		auto& DataPF = DataPerFrames[RsdDataPF.FrameIndex];
+		for (uint32_t BSKIndex = 0; BSKIndex < DataPF.BrickSortKeys.size(); ++BSKIndex)
+		{
+#ifdef DEPTHBOX_DEBUG
+			if (AvailableAtlasBrick.empty())
+			{
+				throw std::exception("Algorithm Error!");
+			}
+#endif
+			uint32_t BrickIndexWithFrame = [&]() {
+				BrickSortKey	   BSKey = DataPF.BrickSortKeys[BSKIndex];
+				CoordWithFrameType BrickCoordWithFrame;
+				BrickCoordWithFrame.x = BSKey.LevelPosition.X;
+				BrickCoordWithFrame.y = BSKey.LevelPosition.Y;
+				BrickCoordWithFrame.z = BSKey.LevelPosition.Z;
+				BrickCoordWithFrame.w = RsdDataPF.FrameIndex;
+
+				return BrickCoordToIndex(BrickCoordWithFrame);
+			}();
+
+			uint32_t AtlasBrickIndex = AvailableAtlasBrick.back();
+			AvailableAtlasBrick.pop_back();
+
+			RsdDataPF.BrickWithFrameToAtlasBrick.emplace(BrickIndexWithFrame, AtlasBrickIndex);
+			BrickWithFrameToAtlasBrick[BrickIndexWithFrame] = AtlasBrickIndex;
+			AtlasBrickToBrickWithFrame[AtlasBrickIndex] = BrickIndexWithFrame;
+		}
+
+		// Dispatch async CUDA Tasks first
+		transferBrickDataToAtlas(ResidentIndex);
+		updateDepthBox(ResidentIndex);
+	}
+
+	// Ensure the playing frame is NOT at the head of ResidentIndices eventually,
+	// if it is NOT the to-be-played frame
+	if (PlayingResidentFrameIndexItr != ResidentIndices.end()
+		&& PlayingResidentFrameIndexItr == ResidentIndices.begin())
+	{
+		uint32_t ResidentIndex = *PlayingResidentFrameIndexItr;
+		auto&	 RsdDataPF = ResidentDataPerFrames[ResidentIndex];
+
+		if (RsdDataPF.FrameIndex != FrameIndex)
+		{
+			ResidentIndices.erase(PlayingResidentFrameIndexItr);
+			ResidentIndices.emplace_back(ResidentIndex);
+			PlayingResidentFrameIndexItr = RsdDataPF.ResidentIndicesItr =
+				std::prev(ResidentIndices.end());
 		}
 	}
 
-	// Popup the Device VDB Data if it is ready
-	if (!ResidentIndices.empty()
-		&& !ResidentDataPerFrames[ResidentIndices.front()].BrickWithFrameToAtlasBrick.empty())
+	// If the to-be-played frame has been cached already, pop it to the front
+	if (CachedRsdDataPFPtr)
 	{
-		auto& RsdDataPF = ResidentDataPerFrames[ResidentIndices.front()];
-		RsdDataPF.Wait(getStream(EStream::Host), ResidentDataPerFrame::EEvent::BuildVDB);
-
-		PopupFrameParams.OutVDB = this;
-		PopupFrameParams.InRsdDataPF = &RsdDataPF;
-		CUDA_CHECK(cudaLaunchHostFunc(getStream(EStream::Host), Popup, &PopupFrameParams));
+		switchFrame(*CachedRsdDataPFPtr);
 	}
-	else
+	// Dispatch sync CUDA Tasks then
+	for (uint32_t ResidentIndex : NewNeededResidentIndices)
 	{
-		dVDBDataCurrentFrame = nullptr;
+		auto& RsdDataPF = ResidentDataPerFrames[ResidentIndex];
+		buildVDB(ResidentIndex);
+
+		// If the to-be-played frame has NOT been cached yet, pop it to the front
+		if (RsdDataPF.FrameIndex == ResidentDataPerFrames[ResidentIndices.front()].FrameIndex)
+		{
+			switchFrame(RsdDataPF);
+		}
 	}
 }
 
-void DepthBoxVDB::VolData::VDB::invalidate()
+void DepthBoxVDB::VolData::VDB::invalidateResidentFrames()
 {
-	waitForAllStream();
+	waitForAllTasks();
 
-	DataPerFrames.clear();
+	dVDBDataCurrentFrame = nullptr;
+	PlayingResidentFrameIndexItr = ResidentIndices.end();
 
 	MaxResidentFrameNum = 0;
 	ResidentIndices.clear();
-	ResidentDataPerFrames.clear();
 
-	dVDBDataCurrentFrame = nullptr;
+	AvailableResidentIndices.clear();
+	ResidentDataPerFrames.clear();
 
 	AvailableAtlasBrick.clear();
 	AtlasBrickToBrickWithFrame.clear();
 	BrickWithFrameToAtlasBrick.clear();
 }
 
-void DepthBoxVDB::VolData::VDB::waitForAllStream()
+void DepthBoxVDB::VolData::VDB::invalidate()
 {
-	for (uint32_t i = 0; i < static_cast<uint32_t>(EStream::Max); ++i)
+	waitForAllTasks();
+
+	invalidateResidentFrames();
+
+	DataPerFrames.clear();
+
+	Status.AtlasGPUMemInByte = Status.PoolGPUMemInByteForAllFrames = 0;
+}
+
+void DepthBoxVDB::VolData::VDB::waitForAllTasks()
+{
+	for (uint32_t i = 0; i < static_cast<uint32_t>(EStream::Num); ++i)
 	{
 		CUDA_CHECK(cudaStreamSynchronize(Streams[i]));
 	}

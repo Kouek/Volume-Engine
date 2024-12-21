@@ -25,7 +25,7 @@ TOptional<FString> FVolDataVDBParameters::InitializeAndCheck(
 		CHECK(LogChildPerLevels[i], 2, kMaxLogChildPerLevel);
 	}
 	CHECK(MaxAllowedGPUMemoryInGB, 1, 64);
-	CHECK(MaxAllowedResidentFrameNum, 1, 6);
+	CHECK(MaxAllowedResidentFrameNum, 2, 64);
 
 #undef CHECK
 
@@ -151,8 +151,18 @@ UVolDataVDBComponent::UVolDataVDBComponent(const FObjectInitializer&)
 	}
 
 	CPUData = MakeShared<FVolDataVDBCPUData>();
+
 	VDB = DepthBoxVDB::VolData::IVDB::Create({});
+	{
+		VDBChanged.AddLambda([this]() {
+			DepthBoxVDB::VolData::IVDB::Status Status = VDB->GetStatus();
+			AtlasGPUMemInByte = Status.AtlasGPUMemInByte;
+			PoolGPUMemInByteForAllFrames = Status.PoolGPUMemInByteForAllFrames;
+		});
+	}
 }
+
+UVolDataVDBComponent::~UVolDataVDBComponent() {}
 
 void UVolDataVDBComponent::LoadRAWVolume()
 {
@@ -169,7 +179,6 @@ void UVolDataVDBComponent::LoadRAWVolume()
 		LoadRAWVolumeParams.SourcePaths.Add(FFilePath{ Files[i] });
 	}
 	LoadRAWVolumeParams.bNeedReload = true;
-	LoadRAWVolumeParams.ValidFrameNum = 0;
 
 	buildVDB();
 }
@@ -198,7 +207,28 @@ void UVolDataVDBComponent::PostLoad()
 {
 	Super::PostLoad();
 
+	registerFrameSwitcher();
 	buildVDB(true);
+}
+
+void UVolDataVDBComponent::EndPlay(EEndPlayReason::Type Reason)
+{
+	unregisterFrameSwitcher();
+}
+
+void UVolDataVDBComponent::BeginDestroy()
+{
+	while (true)
+	{
+		bool bFinished = BuildVDBCS.TryLock();
+		if (bFinished)
+		{
+			BuildVDBCS.Unlock();
+			break;
+		}
+	}
+
+	Super::BeginDestroy();
 }
 
 #if WITH_EDITOR
@@ -217,12 +247,23 @@ void UVolDataVDBComponent::PostEditChangeProperty(FPropertyChangedEvent& Propert
 			|| PropertyChangedEvent.GetPropertyName()
 				== GET_MEMBER_NAME_CHECKED(FVolDataVDBParameters, MaxAllowedResidentFrameNum))
 		{
-			buildVDB(false, true);
+			buildVDB(false, false, true);
 		}
 		else
 		{
 			buildVDB();
 		}
+	}
+
+	if (PropertyChangedEvent.GetMemberPropertyName() == GET_MEMBER_NAME_CHECKED(UVolDataVDBComponent, NextFrameIndex))
+	{
+		VolData::FStdOutputLinker Linker;
+		VDB->SwitchToFrame(NextFrameIndex);
+	}
+
+	if (PropertyChangedEvent.GetMemberPropertyName() == GET_MEMBER_NAME_CHECKED(UVolDataVDBComponent, FrameDuration))
+	{
+		registerFrameSwitcher();
 	}
 }
 #endif
@@ -375,10 +416,10 @@ void UVolDataVDBComponent::syncTransferFunctionFromCurve()
 	CPUData->TransferFunctionDataPreIntegrated = FVolDataTransferFunction::PreIntegrateFromFlatArray<false>(
 		CPUData->TransferFunctionData, LoadTransferFunctionParameters.Resolution);
 
-	TransferFunctionChanged.Broadcast(this);
+	TransferFunctionChanged.Broadcast();
 }
 
-void UVolDataVDBComponent::buildVDB(bool bNeedReload, bool bNeedRelayoutAtlas)
+void UVolDataVDBComponent::buildVDB(bool bNeedReload, bool bNeedRelayoutAtlas, bool bNeedRecacheResidentFrames)
 {
 	bool bNeedFullRebuild = bNeedRelayoutAtlas;
 
@@ -391,54 +432,118 @@ void UVolDataVDBComponent::buildVDB(bool bNeedReload, bool bNeedRelayoutAtlas)
 		bNeedFullRebuild |= LoadTransferFunctionParameters.bNeedFullRebuild;
 	}
 
-	AsyncTask(ENamedThreads::Type::AnyThread, [this, bNeedReload, bNeedFullRebuild]() mutable {
-		if (bNeedReload || LoadRAWVolumeParams.bNeedReload)
-		{
-			loadRAWVolume(0);
+	AsyncTask(
+		ENamedThreads::Type::AnyThread, [this, bNeedReload, bNeedRecacheResidentFrames, bNeedFullRebuild]() mutable {
+			FScopeLock BuildVDBSL(&BuildVDBCS);
 
-			LoadRAWVolumeParams.bNeedReload = false;
-			bNeedFullRebuild = true;
-		}
+			LoadRAWVolumeParams.ValidFrameNum = 0;
 
-		if (!CPUData->IsComplete())
-		{
-			UE_LOG(LogVolData, Error, TEXT("CPUData is incomplete, cannot perform VDB Building."));
-			return;
-		}
-
-		{
-			auto ErrMsgOpt = VDBParams.InitializeAndCheck(CPUData->VoxelPerVolume, LoadRAWVolumeParams.VoxelType);
-			if (ErrMsgOpt.IsSet())
+			if (bNeedReload || LoadRAWVolumeParams.bNeedReload
+				|| (LoadRAWVolumeParams.SourcePaths.Num() > 1 && bNeedFullRebuild))
 			{
-				UE_LOG(LogVolData, Error, TEXT("%s"), *ErrMsgOpt.GetValue());
+				loadRAWVolume(0);
+
+				LoadRAWVolumeParams.bNeedReload = false;
+				bNeedFullRebuild = true;
+			}
+
+			if (!CPUData->IsComplete())
+			{
+				UE_LOG(LogVolData, Error, TEXT("CPUData is incomplete, cannot perform VDB Building."));
 				return;
 			}
-		}
 
-		if (bNeedFullRebuild)
-		{
-			VolData::FStdOutputLinker Linker;
-			VDB->StartAppendFrame({ .EmptyScalarRanges = CPUData->EmptyScalarRanges.GetData(),
-				.EmptyScalarRangeNum = CPUData->EmptyScalarRangeNum,
-				.MaxAllowedGPUMemoryInGB = VDBParams.MaxAllowedGPUMemoryInGB,
-				.MaxAllowedResidentFrameNum = VDBParams.MaxAllowedResidentFrameNum,
-				.VDBParams = VDBParams });
-			VDB->AppendFrame({
-				.RAWVolumeData = CPUData->RAWVolumeData.GetData(),
-			});
-
-			for (int32 FrameIndex = 1; FrameIndex < LoadRAWVolumeParams.SourcePaths.Num(); ++FrameIndex)
 			{
-				if (!loadRAWVolume(FrameIndex))
-					continue;
+				auto ErrMsgOpt = VDBParams.InitializeAndCheck(CPUData->VoxelPerVolume, LoadRAWVolumeParams.VoxelType);
+				if (ErrMsgOpt.IsSet())
+				{
+					UE_LOG(LogVolData, Error, TEXT("%s"), *ErrMsgOpt.GetValue());
+					return;
+				}
+			}
+
+			if (bNeedFullRebuild)
+			{
+				VolData::FStdOutputLinker Linker;
+				VDB->StartAppendFrame({ .EmptyScalarRanges = CPUData->EmptyScalarRanges.GetData(),
+					.EmptyScalarRangeNum = CPUData->EmptyScalarRangeNum,
+					.MaxAllowedGPUMemoryInGB = VDBParams.MaxAllowedGPUMemoryInGB,
+					.MaxAllowedResidentFrameNum = VDBParams.MaxAllowedResidentFrameNum,
+					.VDBParams = VDBParams });
 
 				VDB->AppendFrame({
 					.RAWVolumeData = CPUData->RAWVolumeData.GetData(),
 				});
-			}
+				UE_LOG(LogVolData, Log, TEXT("Start Append Frame: %s"), *LoadRAWVolumeParams.SourcePaths[0].FilePath);
 
-			VDB->EndAppendFrame();
-			VDBParams.MaxResidentFrameNum = VDB->GetMaxResidentFrameNum();
-		}
-	});
+				for (int32 FrameIndex = 1; FrameIndex < LoadRAWVolumeParams.SourcePaths.Num(); ++FrameIndex)
+				{
+					if (!loadRAWVolume(FrameIndex))
+						continue;
+
+					VDB->AppendFrame({
+						.RAWVolumeData = CPUData->RAWVolumeData.GetData(),
+					});
+					UE_LOG(LogVolData, Log, TEXT("Append Frame: %s"),
+						*LoadRAWVolumeParams.SourcePaths[FrameIndex].FilePath);
+				}
+
+				VDB->EndAppendFrame();
+				UE_LOG(LogVolData, Log, TEXT("End Append Frame"));
+				VDBParams.MaxResidentFrameNum = VDB->GetMaxResidentFrameNum();
+
+				VDBChanged.Broadcast();
+			}
+			else if (bNeedRecacheResidentFrames)
+			{
+				VDB->RecacheResidentFrames({ .MaxAllowedGPUMemoryInGB = VDBParams.MaxAllowedGPUMemoryInGB,
+					.MaxAllowedResidentFrameNum = VDBParams.MaxAllowedResidentFrameNum });
+				UE_LOG(LogVolData, Log, TEXT("Recache Resident Frames"));
+				VDBParams.MaxResidentFrameNum = VDB->GetMaxResidentFrameNum();
+
+				VDBChanged.Broadcast();
+			}
+		});
+}
+
+void UVolDataVDBComponent::registerFrameSwitcher()
+{
+	GetWorld()->GetTimerManager().SetTimer(
+		FrameSwitcher,
+		[this]() {
+			VolData::FStdOutputLinker Linker;
+
+			if (bEnablePlayLoop)
+			{
+
+				if (!VDB->IsSwitched())
+					return;
+
+				CurrentFrameIndex = VDB->GetFrameIndex();
+				static bool bShowed = false;
+				if (CurrentFrameIndex == NextFrameIndex && bShowed)
+				{
+					// At least show each frame for enough duration
+					bShowed = false;
+					return;
+				}
+
+				NextFrameIndex = (CurrentFrameIndex + 1) % VDB->GetFrameNum();
+				VDB->SwitchToFrame(NextFrameIndex);
+				bShowed = true;
+			}
+			else
+			{
+				if (!VDB->IsSwitched())
+					return;
+
+				CurrentFrameIndex = VDB->GetFrameIndex();
+			}
+		},
+		FrameDuration, true);
+}
+
+void UVolDataVDBComponent::unregisterFrameSwitcher()
+{
+	GetWorld()->GetTimerManager().ClearTimer(FrameSwitcher);
 }
